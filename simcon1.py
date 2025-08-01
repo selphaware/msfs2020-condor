@@ -1,12 +1,14 @@
 # simcon1.py
 # pip install SimConnect
 from __future__ import annotations
+import time
 from typing import Optional, Callable
 from SimConnect import SimConnect, AircraftRequests, AircraftEvents
 
 __author__ = "Usman Ahmad"
 
 AXIS_MAX = 16383  # -16383..+16383 for trim axis
+FTPS_TO_KT = 1.0 / 1.687809857  # ft/s -> knots
 
 class MSFSController:
     def __init__(self) -> None:
@@ -181,6 +183,155 @@ class MSFSController:
         if invert:
             pct = -pct
         self._send_axis_or_raise(self._evt_rudder_axis, self._pct_to_axis(pct), "Rudder")
+
+    # Replace/augment helpers inside MSFSController
+    def _simvar_name(self, name: str) -> str:
+        """Normalize to the underscore style used by Python-SimConnect."""
+        return name.replace(" ", "_")
+
+    def _get_var(self, name: str, attempts: int = 20, interval: float = 0.05):
+        """
+        Read a SimVar with brief retries until a real value (not None) arrives.
+        Name should be in SDK style with spaces or underscores; we'll normalize.
+        """
+        key = self._simvar_name(name)
+        # Prefer AircraftRequests.find(...).get() which is reliable in this lib
+        try:
+            req = self.aq.find(key)
+        except Exception:
+            req = None
+
+        for _ in range(max(1, attempts)):
+            try:
+                if req is not None:
+                    v = req.get()
+                else:
+                    v = self.aq.get(key)
+            except Exception:
+                v = None
+            if v is not None:
+                return v
+            time.sleep(interval)
+        return None  # caller decides the default
+
+    # ----------- Basic states -----------
+    def get_parking_brake_position(self) -> float:
+        """0.0 = off, 1.0 = on."""
+        v = self._get_var("BRAKE_PARKING_POSITION")
+        return float(v) if v is not None else 0.0
+
+    def is_on_ground(self) -> bool:
+        v = self._get_var("SIM_ON_GROUND")
+        return bool(int(v)) if v is not None else False
+
+    # ----------- Altitude / position / attitude -----------
+    def get_altitudes(self) -> dict:
+        return {
+            "msl": float(self._get_var("PLANE_ALTITUDE") or 0.0),
+            "agl": float(self._get_var("ALTITUDE_AGL") or 0.0),
+            "indicated": float(self._get_var("INDICATED_ALTITUDE") or 0.0),
+        }
+
+    def get_position(self) -> dict:
+        return {
+            "lat": float(self._get_var("PLANE_LATITUDE") or 0.0),
+            "lon": float(self._get_var("PLANE_LONGITUDE") or 0.0),
+        }
+
+    def get_attitude(self) -> dict:
+        return {
+            "pitch": float(self._get_var("PLANE_PITCH_DEGREES") or 0.0),
+            "bank": float(self._get_var("PLANE_BANK_DEGREES") or 0.0),
+            "hdg_true": float(self._get_var("PLANE_HEADING_DEGREES_TRUE") or 0.0),
+            "hdg_mag": float(self._get_var("PLANE_HEADING_DEGREES_MAGNETIC") or 0.0),
+        }
+
+    def get_vertical_speed_fpm(self) -> float:
+        return float(self._get_var("VERTICAL_SPEED") or 0.0)
+
+    def get_speeds(self) -> dict:
+        gs_ftps = float(self._get_var("GROUND_VELOCITY") or 0.0)  # ft/s per SDK
+        return {
+            "ias": float(self._get_var("AIRSPEED_INDICATED") or 0.0),  # kt
+            "tas": float(self._get_var("AIRSPEED_TRUE") or 0.0),       # kt
+            "mach": float(self._get_var("AIRSPEED_MACH") or 0.0),
+            "gs": gs_ftps * FTPS_TO_KT,                                # kt
+        }
+
+    # ----------- Engines / throttle -----------
+    def _get_num_engines(self) -> int:
+        v = self._get_var("NUMBER_OF_ENGINES")
+        try:
+            n = int(v) if v is not None else 1
+        except Exception:
+            n = 1
+        return max(1, min(n, 8))
+
+    def get_engine_combustion(self, engine: int | None = None):
+        """
+        True if running (combustion). If engine=None, list for all engines.
+        """
+        n = self._get_num_engines()
+        def _one(i: int) -> bool:
+            v = self._get_var(f"GENERAL_ENG_COMBUSTION:{i}")
+            return bool(int(v)) if v is not None else False
+        if engine is None:
+            return [_one(i) for i in range(1, n + 1)]
+        return _one(int(engine))
+
+    def is_any_engine_on(self) -> bool:
+        return any(self.get_engine_combustion())
+
+    def get_throttle_percent(self, engine: int | None = None):
+        """
+        Throttle lever position percent(s) 0..100. If engine=None, list for all.
+        """
+        n = self._get_num_engines()
+        def _one(i: int) -> float:
+            v = self._get_var(f"GENERAL_ENG_THROTTLE_LEVER_POSITION:{i}")
+            return float(v) if v is not None else 0.0
+        if engine is None:
+            return [_one(i) for i in range(1, n + 1)]
+        return _one(int(engine))
+
+    # ----------- Gear / flaps / trim -----------
+    def get_gear_handle_position(self) -> float:
+        """0.0 = up, 1.0 = down."""
+        v = self._get_var("GEAR_HANDLE_POSITION")
+        return float(v) if v is not None else 0.0
+
+    def get_flaps_percent(self) -> float:
+        pos_0_1 = float(self._get_var("FLAPS_HANDLE_POSITION") or 0.0)
+        return max(0.0, min(100.0, pos_0_1 * 100.0))
+
+    def get_trim_percent(self) -> float:
+        v = self._get_var("ELEVATOR_TRIM_PCT")
+        if v is None:
+            return 0.0
+        try:
+            return float(max(-100.0, min(100.0, float(v))))
+        except Exception:
+            return 0.0
+
+    # ----------- Control surface deflections -----------
+    def get_control_surface_percents(self) -> dict:
+        def to_pct(x):
+            try:
+                return float(max(-100.0, min(100.0, (float(x) or 0.0) * 100.0)))
+            except Exception:
+                return 0.0
+        return {
+            "elevator": to_pct(self._get_var("ELEVATOR_POSITION")),
+            "aileron":  to_pct(self._get_var("AILERON_POSITION")),
+            "rudder":   to_pct(self._get_var("RUDDER_POSITION")),
+        }
+
+    # ----------- Electrical -----------
+    def get_electrical(self) -> dict:
+        return {
+            "master_battery": bool(int(self._get_var("ELECTRICAL_MASTER_BATTERY") or 0)),
+            "avionics_master": bool(int(self._get_var("AVIONICS_MASTER_SWITCH") or 0)),
+        }
 
 
 if __name__ == "__main__":
