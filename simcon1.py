@@ -309,7 +309,7 @@ class MSFSController:
         if v is None:
             return 0.0
         try:
-            return float(max(-100.0, min(100.0, float(v))))
+            return float(max(-100.0, min(100.0, float(v) * 100)))
         except Exception:
             return 0.0
 
