@@ -18,6 +18,9 @@ class MSFSController:
         self._evt_eng_start       = self._evt("ENGINE_AUTO_START")
         self._evt_eng_shutdown    = self._evt("ENGINE_AUTO_SHUTDOWN")
         self._evt_trim_set        = self._evt("ELEVATOR_TRIM_SET", "AXIS_ELEV_TRIM_SET")
+        self._evt_elevator_axis = self._evt("AXIS_ELEVATOR_SET", "ELEVATOR_SET")
+        self._evt_aileron_axis  = self._evt("AXIS_AILERONS_SET", "AILERON_SET")
+        self._evt_rudder_axis   = self._evt("AXIS_RUDDER_SET", "RUDDER_SET")
 
     def _evt(self, *names: str) -> Optional[Callable]:
         for n in names:
@@ -143,6 +146,48 @@ class MSFSController:
                 if not callable(self._evt_throttle_axis):
                     raise RuntimeError(f"THROTTLE{engine}_SET and AXIS_THROTTLE_SET not available")
                 self._evt_throttle_axis(val_0_16383)
+
+    def _pct_to_axis(self, pct: float) -> int:
+        # Clamp [-100,100] and map to [-16383, +16383]
+        p = max(-100.0, min(100.0, float(pct)))
+        return int(round((p / 100.0) * AXIS_MAX))
+
+    def _send_axis_or_raise(self, evt, value: int, name: str) -> None:
+        if not callable(evt):
+            raise RuntimeError(f"{name} event not available")
+        evt(value)
+
+    def set_elevator_percent(self, pct: float, invert: bool = False) -> None:
+        """
+        Elevator (pitch) input: -100..+100
+        + = pull back (nose up) on most setups (set invert=True if reversed)
+        """
+        if invert:
+            pct = -pct
+        self._send_axis_or_raise(self._evt_elevator_axis, self._pct_to_axis(pct), "Elevator")
+
+    # Alias to match your wording "set the elevation"
+    def set_elevation_percent(self, pct: float, invert: bool = False) -> None:
+        self.set_elevator_percent(pct, invert=invert)
+
+    def set_aileron_percent(self, pct: float, invert: bool = False) -> None:
+        """
+        Aileron (roll) input: -100..+100
+        - = roll left, + = roll right (set invert=True if reversed)
+        """
+        if invert:
+            pct = -pct
+        self._send_axis_or_raise(self._evt_aileron_axis, self._pct_to_axis(pct), "Aileron")
+
+    def set_rudder_percent(self, pct: float, invert: bool = False) -> None:
+        """
+        Rudder (yaw) input: -100..+100
+        - = yaw left, + = yaw right (set invert=True if reversed)
+        """
+        if invert:
+            pct = -pct
+        self._send_axis_or_raise(self._evt_rudder_axis, self._pct_to_axis(pct), "Rudder")
+
 
 if __name__ == "__main__":
     ctl = MSFSController()
