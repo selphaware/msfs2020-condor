@@ -4,6 +4,8 @@ from __future__ import annotations
 from typing import Optional, Callable
 from SimConnect import SimConnect, AircraftRequests, AircraftEvents
 
+__author__ = "Usman Ahmad"
+
 AXIS_MAX = 16383  # -16383..+16383 for trim axis
 
 class MSFSController:
@@ -33,21 +35,13 @@ class MSFSController:
         return None
 
     # ---------- Parking brake ----------
-    def parking_brake_on(self) -> None:
+    def parking_brake_toggle(self) -> None:
         if callable(self._evt_parking_set):
             self._evt_parking_set(1)
             return
         # Fallback: toggle only if currently off
         pos = self.aq.get("BRAKE PARKING POSITION") or 0.0  # 0 off, 1 on
         if pos < 0.5 and callable(self._evt_parking_toggle):
-            self._evt_parking_toggle()
-
-    def parking_brake_off(self) -> None:
-        if callable(self._evt_parking_set):
-            self._evt_parking_set(0)
-            return
-        pos = self.aq.get("BRAKE PARKING POSITION") or 0.0
-        if pos >= 0.5 and callable(self._evt_parking_toggle):
             self._evt_parking_toggle()
 
     # ---------- Engine auto start / stop ----------
