@@ -1,0 +1,1 @@
+!(lambda: exec('import gc, pdb; next(o for o in gc.get_objects() if isinstance(o, pdb.Pdb)).prompt = "condor >>> "', {}))()

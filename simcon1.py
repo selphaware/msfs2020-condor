@@ -25,6 +25,12 @@ class MSFSController:
         self._evt_elevator_axis = self._evt("AXIS_ELEVATOR_SET", "ELEVATOR_SET")
         self._evt_aileron_axis  = self._evt("AXIS_AILERONS_SET", "AILERON_SET")
         self._evt_rudder_axis   = self._evt("AXIS_RUDDER_SET", "RUDDER_SET")
+        self._evt_batt_on       = self._evt("MASTER_BATTERY_ON")
+        self._evt_batt_off      = self._evt("MASTER_BATTERY_OFF")
+        self._evt_batt_toggle   = self._evt("TOGGLE_MASTER_BATTERY")
+
+        self._evt_avionics_set  = self._evt("AVIONICS_MASTER_SET")
+        self._evt_avionics_tog  = self._evt("TOGGLE_AVIONICS_MASTER")
 
     def _evt(self, *names: str) -> Optional[Callable]:
         for n in names:
@@ -332,6 +338,51 @@ class MSFSController:
             "master_battery": bool(int(self._get_var("ELECTRICAL_MASTER_BATTERY") or 0)),
             "avionics_master": bool(int(self._get_var("AVIONICS_MASTER_SWITCH") or 0)),
         }
+
+    # ----------- Master Battery -----------
+    def master_battery_on(self, index: int = 1) -> None:
+        """
+        Turn ON the (master) battery. For most default aircraft, index=1 is fine.
+        Falls back to toggle if needed.
+        """
+        if callable(self._evt_batt_on):
+            self._evt_batt_on(int(index))
+            return
+        # Fallback: only toggle if currently off
+        cur = bool(int(self._get_var("ELECTRICAL_MASTER_BATTERY") or 0))
+        if not cur and callable(self._evt_batt_toggle):
+            self._evt_batt_toggle(int(index))
+
+    def master_battery_off(self, index: int = 1) -> None:
+        """
+        Turn OFF the (master) battery. For most default aircraft, index=1 is fine.
+        Falls back to toggle if needed.
+        """
+        if callable(self._evt_batt_off):
+            self._evt_batt_off(int(index))
+            return
+        cur = bool(int(self._get_var("ELECTRICAL_MASTER_BATTERY") or 0))
+        if cur and callable(self._evt_batt_toggle):
+            self._evt_batt_toggle(int(index))
+
+    # ----------- Avionics Master -----------
+    def avionics_master_on(self) -> None:
+        """Set avionics master ON (fallback to toggle)."""
+        if callable(self._evt_avionics_set):
+            self._evt_avionics_set(1)
+            return
+        cur = bool(int(self._get_var("AVIONICS_MASTER_SWITCH") or 0))
+        if not cur and callable(self._evt_avionics_tog):
+            self._evt_avionics_tog()
+
+    def avionics_master_off(self) -> None:
+        """Set avionics master OFF (fallback to toggle)."""
+        if callable(self._evt_avionics_set):
+            self._evt_avionics_set(0)
+            return
+        cur = bool(int(self._get_var("AVIONICS_MASTER_SWITCH") or 0))
+        if cur and callable(self._evt_avionics_tog):
+            self._evt_avionics_tog()
 
 
 if __name__ == "__main__":
