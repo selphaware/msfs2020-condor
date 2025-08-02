@@ -332,11 +332,56 @@ class MSFSController:
             "rudder":   to_pct(self._get_var("RUDDER_POSITION")),
         }
 
-    # ----------- Electrical -----------
     def get_electrical(self) -> dict:
+        """
+        Returns switch states (including indexed ones when available) and bus voltages.
+        Also reports whether the electrical/avionics buses are actually powered.
+        """
+        def _b(x):  # to bool
+            try:
+                return bool(int(x))
+            except Exception:
+                return False
+
+        # Read non-indexed first
+        master_any = _b(self._get_var("ELECTRICAL_MASTER_BATTERY") or 0)
+        avionics_any = _b(self._get_var("AVIONICS_MASTER_SWITCH") or 0)
+
+        # Then check for indexed variants and OR them in (1..4 is plenty for most)
+        master_idx = {}
+        avionics_idx = {}
+        for i in range(1, 5):
+            v = self._get_var(f"ELECTRICAL_MASTER_BATTERY:{i}")
+            if v is not None:
+                master_idx[i] = _b(v)
+            v = self._get_var(f"AVIONICS_MASTER_SWITCH:{i}")
+            if v is not None:
+                avionics_idx[i] = _b(v)
+
+        if master_idx:
+            master_any = any(master_idx.values())
+        if avionics_idx:
+            avionics_any = any(avionics_idx.values())
+
+        # Bus voltages (volts). If these are > ~3V, the bus is considered powered.
+        main_bus_v     = float(self._get_var("ELECTRICAL_MAIN_BUS_VOLTAGE") or 0.0)
+        batt_bus_v     = float(self._get_var("ELECTRICAL_BATTERY_BUS_VOLTAGE") or 0.0)
+        avionics_bus_v = float(self._get_var("ELECTRICAL_AVIONICS_BUS_VOLTAGE") or 0.0)
+        powered_thresh = 3.0
+
         return {
-            "master_battery": bool(int(self._get_var("ELECTRICAL_MASTER_BATTERY") or 0)),
-            "avionics_master": bool(int(self._get_var("AVIONICS_MASTER_SWITCH") or 0)),
+            # Switch positions
+            "master_battery_switch": master_any,
+            "master_battery_switches": master_idx or None,   # per-index states if present
+            "avionics_master_switch": avionics_any,
+            "avionics_master_switches": avionics_idx or None,
+
+            # Electrical condition
+            "main_bus_volts": main_bus_v,
+            "battery_bus_volts": batt_bus_v,
+            "avionics_bus_volts": avionics_bus_v,
+            "electrical_powered": (main_bus_v > powered_thresh) or (batt_bus_v > powered_thresh),
+            "avionics_powered": avionics_bus_v > powered_thresh,
         }
 
     # ----------- Master Battery -----------

@@ -1,5 +1,5 @@
 @echo off
 :iLoop
 python stats.py
-TIMEOUT /T 5 /NOBREAK
+TIMEOUT /T 15 /NOBREAK
 goto iLoop
