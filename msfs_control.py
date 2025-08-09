@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 import logging
+import time
 
 try:
     # The widely used Python wrapper for MSFS SimConnect
@@ -176,6 +177,14 @@ class MSFSConnection:
         return val
 
     # -- convenience setters (write) ----------------------------------------
+
+    # --- tiny helpers you can place near the other getters ---
+    def get_on_ground(self) -> bool:
+        return bool(self.get_simvar("SIM ON GROUND"))
+
+    def get_radio_altitude_ft(self) -> float:
+        # RADIO HEIGHT is in feet in MSFS
+        return float(self.get_simvar("RADIO HEIGHT", "Feet"))
 
     # Master battery
     def set_master_battery(self, on: bool) -> None:
@@ -379,6 +388,185 @@ class MSFSConnection:
         if self._sm is None:
             self.connect()
 
+    def takeoff_full_throttle(
+        self,
+        flap_percent: float = 0.0,
+        rotate_kt: float = 85.0,
+        climb_kt: float = 95.0,
+        trim_pct: float = 3.0,
+        rotation_pull_pct: float = 28.0,
+        rotation_hold_s: float = 2.0,
+        timeout_s: float = 120.0,
+    ) -> None:
+        """
+        Simple generic takeoff:
+        - power/avionics on, engines running
+        - set flaps/trim, release parking brake
+        - full throttle, rotate at Vr, positive climb confirmed
+        - gear up, flaps up once safe
+
+        Note: Vr/climb speeds are generic defaults. For best results,
+        pass aircraft-appropriate numbers.
+        """
+        LOGGER.info("TAKEOFF: configuring aircraft")
+        self.set_master_battery(True)
+        self.set_avionics_master(True)
+        self.set_engines_running(True)
+        self.set_landing_gear(True)  # make sure it's down
+        self.set_flaps_percent(flap_percent)
+        if trim_pct is not None:
+            self.set_trim_percent(trim_pct)
+
+        self.set_parking_brake(False)
+        time.sleep(0.5)
+
+        # Line up & apply power
+        LOGGER.info("TAKEOFF: throttles full")
+        self.set_throttle_percent(100.0)
+
+        t0 = time.time()
+        # Accelerate to Vr
+        while time.time() - t0 < timeout_s:
+            ias = self.get_ias_kt()
+            if ias >= rotate_kt:
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("Timed out waiting for Vr")
+
+        # Rotate
+        LOGGER.info("TAKEOFF: rotate (pull %.0f%% for %.1fs)", rotation_pull_pct, rotation_hold_s)
+        self.set_elevator_percent(rotation_pull_pct)
+        t_rot = time.time()
+        while time.time() - t_rot < rotation_hold_s:
+            # If we're airborne already, stop holding early
+            if not self.get_on_ground():
+                break
+            time.sleep(0.05)
+        self.set_elevator_percent(0.0)
+
+        # Wait until definitely airborne / positive climb
+        LOGGER.info("TAKEOFF: checking positive climb")
+        t1 = time.time()
+        while time.time() - t1 < 15.0:
+            if not self.get_on_ground() and self.get_vertical_speed_fpm() > 200:
+                break
+            time.sleep(0.1)
+
+        # Clean up when safe
+        # Use either radio altitude or IAS+VS as simple gates
+        agl = self.get_radio_altitude_ft()
+        if agl < 50:
+            # give it a moment to lift
+            time.sleep(1.0)
+            agl = self.get_radio_altitude_ft()
+
+        if agl >= 50 or self.get_vertical_speed_fpm() > 300:
+            LOGGER.info("TAKEOFF: gear up")
+            self.set_landing_gear(False)
+
+        # Flaps up once accelerating and a bit higher
+        t2 = time.time()
+        while time.time() - t2 < 20.0:
+            ias = self.get_ias_kt()
+            agl = self.get_radio_altitude_ft()
+            if ias >= max(rotate_kt + 10.0, climb_kt) and agl >= 300:
+                LOGGER.info("TAKEOFF: flaps up")
+                self.set_flaps_percent(0.0)
+                break
+            time.sleep(0.2)
+
+        LOGGER.info("TAKEOFF: initial climb established (IAS≈%.0f kt, VS≈%.0f fpm)", self.get_ias_kt(), self.get_vertical_speed_fpm())
+
+    def climb_to_and_hold_altitude(
+        self,
+        target_alt_ft: float,
+        vs_fpm: int = 1500,
+        tolerance_ft: float = 75.0,
+        poll_s: float = 0.25,
+        max_time_s: float = 900.0,
+    ) -> None:
+        """
+        Uses the airplane's autopilot:
+        - AP on
+        - set selected altitude
+        - engage VS hold toward target
+        - when within tolerance, capture ALT HOLD
+
+        Works on most default aircraft; if an airplane has no AP this will
+        raise on the first AP event.
+        """
+        target = int(round(target_alt_ft))
+
+        # Ensure AP master ON
+        try:
+            self.send_event("AP_MASTER_ON")
+        except ValueError:
+            # Toggle if there's no explicit ON
+            ap_on = bool(self.get_simvar("AUTOPILOT MASTER"))
+            if not ap_on:
+                self.send_event("AP_MASTER")
+
+        # Set selected altitude (try both common events)
+        try:
+            self.send_event("AP_ALT_VAR_SET_ENGLISH", target)
+        except ValueError:
+            try:
+                self.send_event("AP_PANEL_ALTITUDE_SET", target)
+            except ValueError:
+                raise ValueError("No altitude-select event available on this aircraft")
+
+        # Decide climb/descend
+        cur = self.get_altitude_ft()
+        delta = target - cur
+        if abs(delta) < tolerance_ft:
+            # Already there → hold
+            try:
+                self.send_event("AP_ALT_HOLD_ON")
+            except ValueError:
+                self.send_event("AP_ALT_HOLD")  # toggle
+            LOGGER.info("ALT HOLD at %.0f ft (already within tolerance)", cur)
+            return
+
+        commanded_vs = int(vs_fpm if delta > 0 else -abs(vs_fpm))
+
+        # Set VS and engage VS hold
+        try:
+            self.send_event("AP_VS_VAR_SET_ENGLISH", commanded_vs)
+        except ValueError:
+            # Some airplanes use increments; try a small loop as a fallback
+            # but most stock aircraft accept the set call.
+            raise ValueError("AP_VS_VAR_SET_ENGLISH not supported by this aircraft")
+
+        try:
+            self.send_event("AP_VS_HOLD_ON")
+        except ValueError:
+            self.send_event("AP_VS_HOLD")  # toggle
+
+        LOGGER.info(
+            "ALT CAPTURE: climbing to %d ft at %d fpm (from %.0f ft)",
+            target, commanded_vs, cur
+        )
+
+        # Monitor until within tolerance, then capture ALT HOLD
+        t0 = time.time()
+        while time.time() - t0 < max_time_s:
+            alt = self.get_altitude_ft()
+            if abs(target - alt) <= tolerance_ft:
+                # zero VS, arm/force ALT HOLD
+                try:
+                    self.send_event("AP_VS_VAR_SET_ENGLISH", 0)
+                except ValueError:
+                    pass
+                try:
+                    self.send_event("AP_ALT_HOLD_ON")
+                except ValueError:
+                    self.send_event("AP_ALT_HOLD")
+                LOGGER.info("ALT HOLD captured at %.0f ft", alt)
+                return
+            time.sleep(poll_s)
+
+        raise TimeoutError(f"Did not reach target altitude {target} ft in time.")
 
 # ---------------------------------------------------------------------------
 # Example usage
@@ -442,6 +630,17 @@ def main() -> None:
         # print("Bank deg:", conn.get_bank_deg())
         # print("HDG true deg:", conn.get_heading_true_deg())
         # print("HDG mag deg:", conn.get_heading_magnetic_deg())
+
+        # conn.connect()
+
+        # 1) Full-throttle takeoff (tweak Vr/flaps per type)
+        # conn.takeoff_full_throttle(flap_percent=10.0, rotate_kt=80.0, climb_kt=190.0)
+
+        # 2) Climb to and hold 10,000 ft
+        # conn.climb_to_and_hold_altitude(10000, vs_fpm=1500)
+
+        # …later, descend and hold 3,000 ft
+        # conn.climb_to_and_hold_altitude(3000, vs_fpm=1200)
 
     finally:
         conn.close()
