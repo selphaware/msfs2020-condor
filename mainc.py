@@ -343,6 +343,67 @@ class MSFSConnection:
             (not on and self.get_landing_gear_down()):
                 self.send_event("GEAR_TOGGLE")
 
+    def get_aileron_percent(self) -> float:
+        # AILERON POSITION returns -1..+1
+        pos = float(self.get_simvar("AILERON_POSITION"))
+        return clamp(pos * 100.0, -100.0, 100.0)
+
+    def get_rudder_percent(self) -> float:
+        pos = float(self.get_simvar("RUDDER_POSITION"))
+        return clamp(pos * 100.0, -100.0, 100.0)
+
+    def get_elevator_percent(self) -> float:
+        pos = float(self.get_simvar("ELEVATOR_POSITION"))
+        return clamp(pos * 100.0, -100.0, 100.0)
+
+    def get_trim_percent(self) -> float:
+        # ELEVATOR TRIM POSITION returns radians or normalized per aircraft; try degrees
+        # If degrees not supported, wrapper will still convert appropriately.
+        val = float(self.get_simvar("ELEVATOR_TRIM_PCT")) * 100
+        return val
+
+    def get_flaps_percent(self) -> float:
+        # FLAPS HANDLE PERCENT returns 0..1
+        pos = float(self.get_simvar("FLAPS_HANDLE_PERCENT"))
+        return pos * 100
+
+    # Flight metrics
+    def get_altitude_ft(self) -> float:
+        return float(self.get_simvar("PLANE_ALTITUDE"))
+
+    def get_aoa_deg(self) -> float:
+        return float(self.get_simvar("INCIDENCE_ALPHA"))
+
+    def get_ias_kt(self) -> float:
+        return float(self.get_simvar("AIRSPEED_INDICATED"))
+
+    def get_tas_kt(self) -> float:
+        return float(self.get_simvar("AIRSPEED_TRUE"))
+
+    def get_ground_speed_kt(self) -> float:
+        # GROUND VELOCITY in knots for convenience
+        return float(self.get_simvar("GROUND_VELOCITY"))
+
+    def get_vertical_speed_fpm(self) -> float:
+        return float(self.get_simvar("VERTICAL_SPEED"))
+
+    def get_pitch_deg(self) -> float:
+        return float(self.get_simvar("PLANE_PITCH_DEGREES"))
+
+    def get_bank_deg(self) -> float:
+        return float(self.get_simvar("PLANE_BANK_DEGREES"))
+
+    def get_heading_true_deg(self) -> float:
+        return float(self.get_simvar("PLANE_HEADING_DEGREES_TRUE"))
+
+    def get_heading_magnetic_deg(self) -> float:
+        return float(self.get_simvar("PLANE_HEADING_DEGREES_MAGNETIC"))
+
+    # Control positions (as percents)
+    def get_throttle_percent(self) -> float:
+        # Average engine 1 position; adjust if you need per-engine.
+        val = float(self.get_simvar("GENERAL_ENG_THROTTLE_LEVER_POSITION:1"))
+        return val
 
 if __name__ == "__main__":
     import pdb

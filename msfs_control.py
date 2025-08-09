@@ -320,15 +320,15 @@ class MSFSConnection:
 
     def get_aileron_percent(self) -> float:
         # AILERON POSITION returns -1..+1
-        pos = float(self.get_simvar("AILERON POSITION"))
+        pos = float(self.get_simvar("AILERON_POSITION"))
         return clamp(pos * 100.0, -100.0, 100.0)
 
     def get_rudder_percent(self) -> float:
-        pos = float(self.get_simvar("RUDDER POSITION"))
+        pos = float(self.get_simvar("RUDDER_POSITION"))
         return clamp(pos * 100.0, -100.0, 100.0)
 
     def get_elevator_percent(self) -> float:
-        pos = float(self.get_simvar("ELEVATOR POSITION"))
+        pos = float(self.get_simvar("ELEVATOR_POSITION"))
         return clamp(pos * 100.0, -100.0, 100.0)
 
     def get_trim_percent(self) -> float:
