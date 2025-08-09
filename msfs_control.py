@@ -180,7 +180,7 @@ class MSFSConnection:
 
     # --- tiny helpers you can place near the other getters ---
     def get_on_ground(self) -> bool:
-        return bool(self.get_simvar("SIM ON GROUND"))
+        return bool(self.get_simvar("SIM_ON_GROUND"))
 
     def get_radio_altitude_ft(self) -> float:
         # RADIO HEIGHT is in feet in MSFS

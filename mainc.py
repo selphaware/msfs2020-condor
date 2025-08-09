@@ -280,6 +280,23 @@ class MSFSConnection:
         else:
             self.send_event("ENGINE_AUTO_SHUTDOWN")
 
+    # Master battery
+    def get_master_battery(self) -> bool:
+        return bool(self.get_simvar("ELECTRICAL_MASTER_BATTERY"))
+
+    def set_master_battery(self, on: bool) -> None:
+        """
+        Set master battery on/off.
+        Uses 'MASTER_BATTERY_SET' if available; otherwise toggles to reach state.
+        """
+        if (on and not self.get_master_battery()) or \
+            (not on and self.get_master_battery()):
+                self.send_event("TOGGLE_MASTER_BATTERY")
+
+    def get_on_ground(self) -> bool:
+        return bool(self.get_simvar("SIM_ON_GROUND"))
+
+
 if __name__ == "__main__":
     import pdb
 
