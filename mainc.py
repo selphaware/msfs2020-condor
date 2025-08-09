@@ -296,6 +296,53 @@ class MSFSConnection:
     def get_on_ground(self) -> bool:
         return bool(self.get_simvar("SIM_ON_GROUND"))
 
+    # Throttle (0..100 %)
+    def set_throttle_percent(self, percent: float) -> None:
+        """Set throttle (all engines) as percent [0..100]."""
+        value = percent_to_unipolar_axis(percent)
+        # Commonly supported:
+        self.send_event("THROTTLE_SET", value)
+
+    # Aileron (−100..+100 %)
+    def set_aileron_percent(self, percent: float) -> None:
+        """Set aileron deflection as percent [-100..100]."""
+        value = percent_to_bipolar_axis(percent)
+        self.send_event("AXIS_AILERONS_SET", value)
+
+    # Rudder (−100..+100 %)
+    def set_rudder_percent(self, percent: float) -> None:
+        """Set rudder deflection as percent [-100..100]."""
+        value = percent_to_bipolar_axis(percent)
+        self.send_event("AXIS_RUDDER_SET", value)
+
+    # Elevator (−100..+100 %)
+    def set_elevator_percent(self, percent: float) -> None:
+        """Set elevator deflection as percent [-100..100]."""
+        value = percent_to_bipolar_axis(percent)
+        self.send_event("AXIS_ELEVATOR_SET", value)
+
+    # Elevator trim (−100..+100 %)
+    def set_trim_percent(self, percent: float) -> None:
+        """Set elevator trim as percent [-100..100]."""
+        # Prefer axis event; some aircraft accept ELEVATOR_TRIM_SET (0..16383) too.
+        self.send_event("ELEVATOR_TRIM_SET", percent_to_bipolar_axis(percent))
+
+    def get_parking_brakes(self) -> bool:
+        return bool(self.get_simvar("BRAKE_PARKING_INDICATOR"))
+
+    def set_parking_brakes(self, on: bool) -> None:
+        if (on and not self.get_parking_brakes()) or \
+            (not on and self.get_parking_brakes()):
+                self.send_event("PARKING_BRAKES")
+
+    def get_landing_gear_down(self) -> bool:
+        return bool(self.get_simvar("GEAR_HANDLE_POSITION"))
+
+    def set_landing_gear_down(self, on: bool) -> None:
+        if (on and not self.get_landing_gear_down()) or \
+            (not on and self.get_landing_gear_down()):
+                self.send_event("GEAR_TOGGLE")
+
 
 if __name__ == "__main__":
     import pdb

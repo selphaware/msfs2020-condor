@@ -182,6 +182,9 @@ class MSFSConnection:
     def get_on_ground(self) -> bool:
         return bool(self.get_simvar("SIM_ON_GROUND"))
 
+    def get_parking_brakes(self) -> bool:
+        return bool(self.get_simvar("BRAKE_PARKING_INDICATOR"))
+
     def get_radio_altitude_ft(self) -> float:
         # RADIO HEIGHT is in feet in MSFS
         return float(self.get_simvar("RADIO HEIGHT", "Feet"))
