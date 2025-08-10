@@ -368,37 +368,47 @@ class MSFSConnection:
         pos = float(self.get_simvar("FLAPS_HANDLE_PERCENT"))
         return pos * 100
 
+    def _wait_for_simvar(self, name: str, units: str | None = None, poll_interval_s: float = 0.01):
+        """Keep polling a simvar until it's non-None and can be cast to float."""
+        while True:
+            try:
+                val = self.get_simvar(name) if units is None else self.get_simvar(name, units)
+                if val is not None:
+                    return float(val)
+            except (TypeError, ValueError):
+                pass
+            time.sleep(poll_interval_s)
+
     # Flight metrics
     def get_altitude_ft(self) -> float:
-        return float(self.get_simvar("PLANE_ALTITUDE"))
+        return self._wait_for_simvar("PLANE_ALTITUDE")
 
     def get_aoa_deg(self) -> float:
-        return float(self.get_simvar("INCIDENCE_ALPHA"))
+        return self._wait_for_simvar("INCIDENCE_ALPHA")
 
     def get_ias_kt(self) -> float:
-        return float(self.get_simvar("AIRSPEED_INDICATED"))
+        return self._wait_for_simvar("AIRSPEED_INDICATED")
 
     def get_tas_kt(self) -> float:
-        return float(self.get_simvar("AIRSPEED_TRUE"))
+        return self._wait_for_simvar("AIRSPEED_TRUE")
 
     def get_ground_speed_kt(self) -> float:
-        # GROUND VELOCITY in knots for convenience
-        return float(self.get_simvar("GROUND_VELOCITY"))
+        return self._wait_for_simvar("GROUND_VELOCITY")
 
     def get_vertical_speed_fpm(self) -> float:
-        return float(self.get_simvar("VERTICAL_SPEED"))
+        return self._wait_for_simvar("VERTICAL_SPEED")
 
     def get_pitch_deg(self) -> float:
-        return float(self.get_simvar("PLANE_PITCH_DEGREES"))
+        return self._wait_for_simvar("PLANE_PITCH_DEGREES")
 
     def get_bank_deg(self) -> float:
-        return float(self.get_simvar("PLANE_BANK_DEGREES"))
+        return self._wait_for_simvar("PLANE_BANK_DEGREES")
 
     def get_heading_true_deg(self) -> float:
-        return float(self.get_simvar("PLANE_HEADING_DEGREES_TRUE"))
+        return self._wait_for_simvar("PLANE_HEADING_DEGREES_TRUE")
 
     def get_heading_magnetic_deg(self) -> float:
-        return float(self.get_simvar("PLANE_HEADING_DEGREES_MAGNETIC"))
+        return self._wait_for_simvar("PLANE_HEADING_DEGREES_MAGNETIC")
 
     # Control positions (as percents)
     def get_throttle_percent(self) -> float:
@@ -691,6 +701,850 @@ def takeoff2(
     print("[DONE] Takeoff + initial climb complete.")
 
 
+def takeoff3(
+    con: MSFSConnection,
+    target_altitude_ft: float,
+    *,
+    climb_kias: float = 180.0,
+    rotate_kias: float = 160.0,
+    max_aoa_deg: float = 12.0,         # hard ceiling for |AOA|
+    max_pitch_deg: float = 15.0,       # don't let pitch exceed this during initial climb
+    elevator_slew_per_s: float = 35.0, # % elevator per second (rate limit)
+    control_rate_hz: float = 10.0,     # control loop frequency
+):
+    """Automated takeoff with smooth rotation and AOA-limited climb (elevator-only)."""
+
+    def wait_until(pred, poll_s=0.1, on_poll=None):
+        """Spin until pred() is True; call on_poll() each tick if provided."""
+        while True:
+            if pred():
+                return
+            if on_poll:
+                on_poll()
+            time.sleep(poll_s)
+
+    dt = 1.0 / control_rate_hz
+    slew_step = elevator_slew_per_s * dt  # max delta-elevator per cycle (in %)
+
+    # --- helpers ------------------------------------------------------------
+
+    def _agl(ground_ft: float) -> float:
+        return con.get_altitude_ft() - ground_ft
+
+    def _get_aoa_deg_safe() -> Optional[float]:
+        """Try a direct AOA read; if unavailable, approximate using FPA."""
+        try:
+            # If your wrapper exposes this directly, prefer it.
+            return float(con.get_aoa_deg())  # SimVar 'INCIDENCE ALPHA' (degrees)
+        except Exception:
+            try:
+                pitch = float(con.get_pitch_deg())
+                vsi_fpm = float(con.get_vertical_speed_fpm())
+                ias_kt = float(con.get_ias_kt())
+                if ias_kt < 50.0:
+                    return None  # unreliable before real airflow
+                speed_fps = ias_kt * 1.68781
+                vsi_fps = vsi_fpm / 60.0
+                # Flight path angle ≈ atan(VS / Speed)
+                fpa_deg = math.degrees(math.atan2(vsi_fps, speed_fps))
+                return pitch - fpa_deg
+            except Exception:
+                return None
+
+    def _ramp_elevator_to(target_pct: float, get_current: Callable[[], float]) -> float:
+        """Slew-limit the change from current elevator to target; returns new command."""
+        current = get_current()
+        delta = target_pct - current
+        if abs(delta) <= slew_step:
+            return target_pct
+        return current + (slew_step if delta > 0 else -slew_step)
+
+    # state carried across the control loop
+    prev_elev_cmd = 0.0
+    prev_ias = None
+    prev_t = None
+
+    # Record starting ground altitude for AGL calc (MSL snapshot at brake release)
+    ground_alt = con.get_altitude_ft()
+    print(f"[INIT] Ground MSL snapshot: {ground_alt:.1f} ft")
+
+    # 1) Battery ON
+    if not con.get_master_battery():
+        print("[STEP 1] Master battery OFF → turning ON")
+        con.set_master_battery(True)
+    else:
+        print("[STEP 1] Master battery already ON")
+
+    # 2) Engines ON (autostart; idempotent on many aircraft)
+    if con.get_on_ground():
+        print("[STEP 2] Requesting ENGINE AUTOSTART")
+        con.set_engines(True)
+    else:
+        print("[STEP 2] Not on ground (already airborne?) — skipping ENGINE AUTOSTART")
+
+    # 3) Parking brake OFF
+    if con.get_parking_brakes():
+        print("[STEP 3] Parking brake ON → releasing")
+        con.set_parking_brakes(False)
+    else:
+        print("[STEP 3] Parking brake already released")
+
+    # 4) Throttle 100%
+    print("[STEP 4] Throttle → 100%")
+    con.set_throttle_percent(100.0)
+
+    # 5) Accelerate to rotate speed with periodic logging
+    last_log_t = time.monotonic()
+
+    def _poll_speed_log():
+        nonlocal last_log_t
+        t = time.monotonic()
+        if t - last_log_t >= 1.0:
+            ias = con.get_ias_kt()
+            alt = con.get_altitude_ft()
+            agl = alt - ground_alt
+            vsi = con.get_vertical_speed_fpm()
+            print(f"[ACCEL] IAS={ias:.1f} kt | ALT={alt:.0f} ft | AGL={agl:.0f} ft | VS={vsi:.0f} fpm")
+            last_log_t = t
+
+    print(f"[STEP 5] Waiting for rotate speed {rotate_kias:.0f} KIAS…")
+    wait_until(lambda: con.get_ias_kt() >= rotate_kias, poll_s=0.1, on_poll=_poll_speed_log)
+
+    # Smooth rotation: target initial pitch ~10°, not a hard -20% elevator step
+    import math
+    target_pitch_deg = 10.0
+    print(f"[ROTATE] Reaching {rotate_kias:.0f} KIAS → smooth rotate to ~{target_pitch_deg:.0f}° pitch")
+
+    rotate_timeout_s = 6.0  # give it a few seconds to lift gently
+    t_end = time.monotonic() + rotate_timeout_s
+    while time.monotonic() < t_end and con.get_on_ground():
+        pitch = con.get_pitch_deg()
+        pitch_err = target_pitch_deg - pitch
+
+        # Simple P controller on pitch for rotation phase, negative elevator is nose-up
+        kp_pitch = -1.2  # % elevator per deg pitch error (negative for nose-up command)
+        raw_cmd = kp_pitch * pitch_err
+
+        # AOA guard during rotation
+        aoa = _get_aoa_deg_safe()
+        if aoa is not None and aoa > max_aoa_deg:
+            # Reduce nose-up (drive elevator more positive)
+            excess = aoa - max_aoa_deg
+            raw_cmd += +1.0 * excess  # push gently
+
+        # Pitch hard ceiling
+        if pitch > max_pitch_deg:
+            raw_cmd += +2.0 * (pitch - max_pitch_deg)
+
+        # Slew-limit around current elevator command
+        new_cmd = _ramp_elevator_to(raw_cmd, lambda: prev_elev_cmd)
+        con.set_elevator_percent(new_cmd)
+        prev_elev_cmd = new_cmd
+
+        time.sleep(dt)
+
+    # 6) Gear up at 500 ft AGL, hold gentle pitch until 1,000 AGL
+    print("[CLIMB] Holding gentle climb; gear retracts at 500 ft AGL, IAS-hold at 1,000 ft AGL.")
+
+    # — Gear at 500 AGL
+    wait_until(lambda: _agl(ground_alt) >= 500.0, poll_s=0.1, on_poll=_poll_speed_log)
+    if con.get_landing_gear_down():
+        print("[GEAR] 500 ft AGL reached → Gear UP")
+        con.set_landing_gear_down(False)
+    else:
+        print("[GEAR] Gear already UP at 500 ft AGL")
+
+    # — Keep climbing to 1,000 AGL with pitch guard
+    while _agl(ground_alt) < 1000.0:
+        pitch = con.get_pitch_deg()
+        pitch_err = target_pitch_deg - pitch
+        kp_pitch = -0.8
+        raw_cmd = kp_pitch * pitch_err
+
+        # AOA & pitch guards
+        aoa = _get_aoa_deg_safe()
+        if aoa is not None and aoa > max_aoa_deg:
+            raw_cmd += +1.0 * (aoa - max_aoa_deg)
+        if pitch > max_pitch_deg:
+            raw_cmd += +2.0 * (pitch - max_pitch_deg)
+
+        # Slew-limit and send
+        new_cmd = _ramp_elevator_to(raw_cmd, lambda: prev_elev_cmd)
+        con.set_elevator_percent(new_cmd)
+        prev_elev_cmd = new_cmd
+
+        _poll_speed_log()
+        time.sleep(dt)
+
+    print("[CLIMB] 1,000 ft AGL reached → switching to IAS-hold climb (smooth).")
+
+    # 6.5) Smooth IAS-hold climb (elevator-only) until target altitude
+    # Control law (PD + protectors):
+    #   elev_cmd = bias + Kp*(IAS_err) + Kd*(d/dt IAS_err)
+    # Sign convention reminder: negative elevator = nose up (slower IAS)
+    bias = -8.0            # base nose-up for climb
+    kp = 0.18              # % elevator per knot error
+    kd = 0.08              # % per (knot/s) derivative to damp porpoising
+    elev_min, elev_max = -22.0, +12.0
+
+    last_ctrl_log_t = time.monotonic()
+
+    while con.get_altitude_ft() < target_altitude_ft:
+        now = time.monotonic()
+        ias = con.get_ias_kt()
+        alt = con.get_altitude_ft()
+        agl = alt - ground_alt
+        vsi = con.get_vertical_speed_fpm()
+
+        # Error terms
+        err = (climb_kias - ias)  # + if we're slow → should command more nose-down (more + elevator)
+        derr = 0.0
+        if prev_ias is not None and prev_t is not None:
+            dtm = max(1e-3, now - prev_t)
+            derr = (err - (climb_kias - prev_ias)) / dtm  # change in speed error (knots/s)
+
+        # Raw command
+        raw_cmd = bias + (kp * err) + (kd * derr)
+
+        # AOA protection (both sides); reduce nose-up if |AOA| too high
+        aoa = _get_aoa_deg_safe()
+        if aoa is not None:
+            if aoa > max_aoa_deg:
+                raw_cmd += +1.2 * (aoa - max_aoa_deg)  # push
+            elif aoa < -max_aoa_deg:
+                raw_cmd -= +1.2 * (-max_aoa_deg - aoa)  # pull a bit less negative
+
+        # Pitch ceiling protection
+        pitch = con.get_pitch_deg()
+        if pitch > max_pitch_deg:
+            raw_cmd += +1.5 * (pitch - max_pitch_deg)
+
+        # Clamp and slew-limit
+        raw_cmd = max(elev_min, min(elev_max, raw_cmd))
+        new_cmd = _ramp_elevator_to(raw_cmd, lambda: prev_elev_cmd)
+
+        # Apply
+        con.set_elevator_percent(new_cmd)
+        prev_elev_cmd = new_cmd
+        prev_ias = ias
+        prev_t = now
+
+        # Logging at ~1 Hz
+        t = time.monotonic()
+        if t - last_ctrl_log_t >= 1.0:
+            aoa_str = f"{aoa:.1f}°" if aoa is not None else "n/a"
+            print(
+                f"[IAS-HOLD] tgt={climb_kias:.0f} | IAS={ias:.1f} kt | ALT={alt:.0f} ft "
+                f"(AGL {agl:.0f}) | VS={vsi:.0f} fpm | PITCH={pitch:.1f}° | AOA={aoa_str} "
+                f"| ELEV_CMD={new_cmd:.1f}%"
+            )
+            last_ctrl_log_t = t
+
+        time.sleep(dt)
+
+    # 7) Level off: smoothly return elevator to neutral
+    print(f"[LEVEL] Target altitude {target_altitude_ft:.0f} ft reached → easing elevator to 0% (level)")
+    while abs(prev_elev_cmd) > 0.5:
+        prev_elev_cmd = _ramp_elevator_to(0.0, lambda: prev_elev_cmd)
+        con.set_elevator_percent(prev_elev_cmd)
+        time.sleep(dt)
+
+    print("[DONE] Takeoff + initial climb complete.")
+
+
+def takeoff4(
+    con: MSFSConnection,
+    target_altitude_ft: float,
+    *,
+    rotate_kias: float = 160.0,
+    climb_kias: float = 180.0,
+    control_rate_hz: float = 10.0,
+    # Pitch limits (angles are aircraft attitude, not AOA)
+    target_pitch_deg: float = 10.0,     # initial rotation target pitch
+    max_pitch_up_deg: float = 18.0,     # hard guard: never exceed this nose-up
+    max_pitch_dn_deg: float = -10.0,    # hard guard: never exceed this nose-down
+    # Controllers
+    pitch_kp: float = -1.0,             # % elevator per deg error (negative → nose up for +err)
+    pitch_kd: float = -0.35,            # % elevator per deg/s (damping)
+    ias_to_pitch_gain: float = 0.05,    # extra pitch target per knot slow (caps apply)
+    ias_to_throttle_gain: float = 0.6,  # % throttle per knot slow
+    base_throttle_percent: float = 100.0,
+    # Actuator rate limits
+    elevator_slew_per_s: float = 35.0,  # % elevator per second
+    throttle_slew_per_s: float = 40.0,  # % throttle per second
+):
+    """
+    Smooth automated takeoff with pitch-angle stabilization and dynamic throttle.
+    - Prevents large pitch excursions (±40°) via hard-envelope protection.
+    - Uses pitch PID (with pitch-rate derivative) and IAS-based trim/throttle.
+    - Elevator and throttle are slew-limited to avoid abrupt changes.
+    """
+
+    import time
+    import math
+
+    def clamp(x, lo, hi):
+        return max(lo, min(hi, x))
+
+    def slew(current, target, step):
+        delta = target - current
+        if abs(delta) <= step:
+            return target
+        return current + (step if delta > 0 else -step)
+
+    def wait_until(pred, poll_s=0.1, on_poll=None):
+        while True:
+            if pred():
+                return
+            if on_poll:
+                on_poll()
+            time.sleep(poll_s)
+
+    dt = 1.0 / control_rate_hz
+    elev_step = elevator_slew_per_s * dt
+    thr_step = throttle_slew_per_s * dt
+
+    # ---- Phase 0: preflight / ground snapshot --------------------------------
+    ground_alt = con.get_altitude_ft()
+    print(f"[INIT] Ground MSL snapshot: {ground_alt:.1f} ft")
+
+    if not con.get_master_battery():
+        print("[STEP 1] Master battery OFF → turning ON")
+        con.set_master_battery(True)
+    else:
+        print("[STEP 1] Master battery already ON")
+
+    if con.get_on_ground():
+        print("[STEP 2] Requesting ENGINE AUTOSTART")
+        con.set_engines(True)
+    else:
+        print("[STEP 2] Already airborne? Skipping ENGINE AUTOSTART")
+
+    if con.get_parking_brakes():
+        print("[STEP 3] Parking brake ON → releasing")
+        con.set_parking_brakes(False)
+    else:
+        print("[STEP 3] Parking brake already released")
+
+    print("[STEP 4] Throttle → takeoff power")
+    con.set_throttle_percent(base_throttle_percent)
+
+    # ---- Phase 1: accelerate to rotate ---------------------------------------
+    last_log_t = time.monotonic()
+    def _accel_log():
+        nonlocal last_log_t
+        t = time.monotonic()
+        if t - last_log_t >= 1.0:
+            ias = con.get_ias_kt()
+            alt = con.get_altitude_ft()
+            agl = alt - ground_alt
+            vsi = con.get_vertical_speed_fpm()
+            pitch = con.get_pitch_deg()
+            print(f"[ACCEL] IAS={ias:.1f} kt | ALT={alt:.0f} ft | AGL={agl:.0f} ft | VS={vsi:.0f} fpm | PITCH={pitch:.1f}°")
+            last_log_t = t
+
+    print(f"[STEP 5] Waiting for rotate speed {rotate_kias:.0f} KIAS…")
+    wait_until(lambda: con.get_ias_kt() >= rotate_kias, poll_s=0.1, on_poll=_accel_log)
+
+    # ---- Phase 2: rotation (smooth ramp to target_pitch_deg) ------------------
+    print(f"[ROTATE] {rotate_kias:.0f} KIAS reached → smooth rotate to ~{target_pitch_deg:.0f}° pitch")
+
+    # Control loop state
+    elev_cmd = 0.0
+    thr_cmd = base_throttle_percent
+    prev_pitch = con.get_pitch_deg()
+    prev_t = time.monotonic()
+
+    # Ramp rotation for a few seconds or until airborne
+    rotate_duration_s = 5.0
+    rotate_end = prev_t + rotate_duration_s
+    while time.monotonic() < rotate_end and con.get_on_ground():
+        now = time.monotonic()
+        dtm = max(1e-3, now - prev_t)
+        pitch = con.get_pitch_deg()
+        pitch_rate = (pitch - prev_pitch) / dtm  # deg/s
+
+        # Rotation target ramp: approach target_pitch_deg smoothly
+        # Use small IAS-based bias so slow acceleration doesn't cause over-pull
+        ias = con.get_ias_kt()
+        target_pitch = target_pitch_deg + clamp((climb_kias - ias) * 0.02, -2.0, 2.0)
+        target_pitch = clamp(target_pitch, 6.0, max_pitch_up_deg - 1.0)
+
+        # Pitch PID (no integral): negative gains → negative elevator for positive error (nose-up)
+        pitch_err = target_pitch - pitch
+        raw_elev = pitch_kp * pitch_err + pitch_kd * pitch_rate
+
+        # Envelope protection (hard): if exceeding limits, add strong counter-command
+        if pitch > max_pitch_up_deg:
+            raw_elev += +2.0 * (pitch - max_pitch_up_deg)  # push
+        if pitch < max_pitch_dn_deg:
+            raw_elev += -2.0 * (pitch - max_pitch_dn_deg)  # pull (note minus because pitch - min is negative)
+
+        # Limit & slew elevator
+        raw_elev = clamp(raw_elev, -25.0, +15.0)
+        elev_cmd = slew(elev_cmd, raw_elev, elev_step)
+        con.set_elevator_percent(elev_cmd)
+
+        prev_pitch, prev_t = pitch, now
+        time.sleep(dt)
+
+    # ---- Phase 3: initial climb to 1000 AGL with angle guard -----------------
+    print("[CLIMB] Climbing out; gear up at 500 AGL; transitioning to IAS hold at 1,000 AGL.")
+
+    # Gear up at 500 AGL
+    def _agl():
+        return con.get_altitude_ft() - ground_alt
+
+    wait_until(lambda: _agl() >= 500.0, poll_s=0.1, on_poll=_accel_log)
+    if con.get_landing_gear_down():
+        print("[GEAR] 500 ft AGL reached → Gear UP")
+        con.set_landing_gear_down(False)
+    else:
+        print("[GEAR] Already UP at 500 ft AGL")
+
+    # Keep a controlled pitch until 1000 AGL (still prioritizing angle safety)
+    while _agl() < 1000.0:
+        now = time.monotonic()
+        dtm = max(1e-3, now - prev_t)
+        pitch = con.get_pitch_deg()
+        pitch_rate = (pitch - prev_pitch) / dtm
+        ias = con.get_ias_kt()
+
+        # IAS-trimmed pitch target (slow → slightly higher target pitch)
+        target_pitch = target_pitch_deg + clamp((climb_kias - ias) * ias_to_pitch_gain, -4.0, 4.0)
+        target_pitch = clamp(target_pitch, 6.0, max_pitch_up_deg - 1.0)
+
+        # Pitch control
+        pitch_err = target_pitch - pitch
+        raw_elev = pitch_kp * pitch_err + pitch_kd * pitch_rate
+
+        # Envelope protection
+        if pitch > max_pitch_up_deg:
+            raw_elev += +2.0 * (pitch - max_pitch_up_deg)
+        if pitch < max_pitch_dn_deg:
+            raw_elev += -2.0 * (pitch - max_pitch_dn_deg)
+
+        raw_elev = clamp(raw_elev, -22.0, +12.0)
+        elev_cmd = slew(elev_cmd, raw_elev, elev_step)
+        con.set_elevator_percent(elev_cmd)
+
+        # Throttle assist toward climb speed
+        thr_target = base_throttle_percent + (climb_kias - ias) * ias_to_throttle_gain
+        thr_target = clamp(thr_target, 70.0, 100.0)
+        thr_cmd = slew(thr_cmd, thr_target, thr_step)
+        con.set_throttle_percent(thr_cmd)
+
+        # Overshoot management: if pitch rising past hard limit, also bleed a bit of power
+        if pitch > (max_pitch_up_deg - 1.0):
+            thr_cmd = max(70.0, thr_cmd - 2.0)
+            con.set_throttle_percent(thr_cmd)
+
+        prev_pitch, prev_t = pitch, now
+        _accel_log()
+        time.sleep(dt)
+
+    print("[CLIMB] 1,000 ft AGL reached → IAS-hold climb with angle protection.")
+
+    # ---- Phase 4: IAS-hold climb to target MSL with angle & throttle control --
+    last_ctrl_log_t = time.monotonic()
+    while con.get_altitude_ft() < target_altitude_ft:
+        now = time.monotonic()
+        dtm = max(1e-3, now - prev_t)
+        pitch = con.get_pitch_deg()
+        pitch_rate = (pitch - prev_pitch) / dtm
+        ias = con.get_ias_kt()
+        alt = con.get_altitude_ft()
+        vsi = con.get_vertical_speed_fpm()
+        agl = alt - ground_alt
+
+        # Target pitch depends on IAS error (slow -> more pitch up), but bounded
+        target_pitch = target_pitch_deg + clamp((climb_kias - ias) * ias_to_pitch_gain, -6.0, 6.0)
+        target_pitch = clamp(target_pitch, 5.0, max_pitch_up_deg - 1.0)
+
+        # Pitch control
+        pitch_err = target_pitch - pitch
+        raw_elev = pitch_kp * pitch_err + pitch_kd * pitch_rate
+
+        # Hard envelope: keep aircraft attitude in safe bounds
+        if pitch > max_pitch_up_deg:
+            raw_elev += +2.5 * (pitch - max_pitch_up_deg)
+        if pitch < max_pitch_dn_deg:
+            raw_elev += -2.5 * (pitch - max_pitch_dn_deg)
+
+        raw_elev = clamp(raw_elev, -22.0, +12.0)
+        elev_cmd = slew(elev_cmd, raw_elev, elev_step)
+        con.set_elevator_percent(elev_cmd)
+
+        # Throttle control to chase climb speed without demanding extreme pitch
+        thr_target = base_throttle_percent + (climb_kias - ias) * ias_to_throttle_gain
+        thr_target = clamp(thr_target, 65.0, 100.0)
+        thr_cmd = slew(thr_cmd, thr_target, thr_step)
+        con.set_throttle_percent(thr_cmd)
+
+        # Logging ~1 Hz
+        t = time.monotonic()
+        if t - last_ctrl_log_t >= 1.0:
+            print(
+                f"[IAS-HOLD] tgtIAS={climb_kias:.0f} | IAS={ias:.1f} kt | ALT={alt:.0f} ft "
+                f"(AGL {agl:.0f}) | VS={vsi:.0f} fpm | PITCH={pitch:.1f}° "
+                f"| ELEV={elev_cmd:.1f}% | THR={thr_cmd:.1f}%"
+            )
+            last_ctrl_log_t = t
+
+        prev_pitch, prev_t = pitch, now
+        time.sleep(dt)
+
+    # ---- Phase 5: level-off ---------------------------------------------------
+    print(f"[LEVEL] Target altitude {target_altitude_ft:.0f} ft reached → easing elevator to 0%")
+    # Smoothly neutralize elevator
+    while abs(elev_cmd) > 0.5:
+        elev_cmd = slew(elev_cmd, 0.0, elev_step)
+        con.set_elevator_percent(elev_cmd)
+        time.sleep(dt)
+
+    # Throttle to a conservative cruise placeholder (leave to AP/next mode)
+    con.set_throttle_percent(clamp(thr_cmd, 60.0, 90.0))
+    print("[DONE] Takeoff + climb complete with pitch stabilization.")
+
+
+
+def takeoff5(
+    con: MSFSConnection,
+    target_altitude_ft: float,
+    *,
+    rotate_kias: float = 160.0,
+    climb_kias: float = 180.0,
+    control_rate_hz: float = 10.0,
+    # Pitch limits (angles are aircraft attitude, not AOA)
+    target_pitch_deg: float = 10.0,     # initial rotation target pitch
+    max_pitch_up_deg: float = 18.0,     # hard guard: never exceed this nose-up
+    max_pitch_dn_deg: float = -10.0,    # hard guard: never exceed this nose-down
+    # Controllers
+    pitch_kp: float = -1.0,             # % elevator per deg error (negative → nose up for +err)
+    pitch_kd: float = -0.35,            # % elevator per deg/s (damping)
+    ias_to_pitch_gain: float = 0.05,    # extra pitch target per knot slow (caps apply)
+    ias_to_throttle_gain: float = 0.6,  # % throttle per knot slow
+    base_throttle_percent: float = 100.0,
+    # Rudder (centerline) controller
+    rudder_kh: float = 0.5,             # % rudder per deg heading/track error
+    rudder_kd: float = 0.35,            # % per deg/s yaw-rate (damping)
+    rudder_kbeta: float = 0.6,          # % per deg sideslip (beta) to center the ball (if available)
+    rudder_slew_per_s: float = 50.0,    # % per second
+    rudder_limit_pct: float = 25.0,     # mechanical/comfort limit
+    # Actuator rate limits
+    elevator_slew_per_s: float = 35.0,  # % elevator per second
+    throttle_slew_per_s: float = 40.0,  # % throttle per second
+):
+    """
+    Smooth automated takeoff with pitch-angle stabilization, centerline tracking via rudder,
+    and dynamic throttle. Uses heading/track, yaw-rate, and sideslip (if available) to keep
+    the aircraft aligned and coordinated during the ground roll and early climb.
+    """
+
+    import time
+    import math
+
+    def clamp(x, lo, hi): return max(lo, min(hi, x))
+
+    def slew(current, target, step):
+        d = target - current
+        if abs(d) <= step:
+            return target
+        return current + (step if d > 0 else -step)
+
+    def shortest_angle_deg(a_minus_b):
+        # wrap to [-180, +180]
+        e = (a_minus_b + 180.0) % 360.0
+        return e - 180.0
+
+    def wait_until(pred, poll_s=0.1, on_poll=None):
+        while True:
+            if pred():
+                return
+            if on_poll:
+                on_poll()
+            time.sleep(poll_s)
+
+    # --- Optional getters with graceful fallback ------------------------------
+    def _get_sideslip_deg():
+        # SimVar often named 'INCIDENCE BETA' (deg). If not available, return 0.
+        try:
+            return float(con.get_sideslip_deg())
+        except Exception:
+            return 0.0
+
+    def _get_ground_track_deg():
+        # Prefer GPS ground track if your wrapper exposes it; fallback to magnetic heading.
+        try:
+            return float(con.get_ground_track_deg())
+        except Exception:
+            return float(con.get_heading_magnetic_deg())
+
+    def _get_yaw_rate_deg_s(prev_hdg, prev_t):
+        # If simvar for yaw rate exists, use it; else estimate from heading derivative.
+        try:
+            return float(con.get_yaw_rate_deg_s())
+        except Exception:
+            now = time.monotonic()
+            dtm = max(1e-3, now - prev_t[0])
+            hdg = float(con.get_heading_magnetic_deg())
+            rate = shortest_angle_deg(hdg - prev_hdg[0]) / dtm
+            prev_hdg[0] = hdg
+            prev_t[0] = now
+            return rate
+
+    dt = 1.0 / control_rate_hz
+    elev_step = elevator_slew_per_s * dt
+    thr_step  = throttle_slew_per_s * dt
+    rud_step  = rudder_slew_per_s * dt
+
+    # ---- Phase 0: preflight / ground snapshot --------------------------------
+    ground_alt = con.get_altitude_ft()
+    runway_hdg = float(con.get_heading_magnetic_deg())  # centerline proxy
+    print(f"[INIT] Ground MSL snapshot: {ground_alt:.1f} ft | Runway heading≈{runway_hdg:.1f}°M")
+
+    if not con.get_master_battery():
+        print("[STEP 1] Master battery OFF → turning ON")
+        con.set_master_battery(True)
+    else:
+        print("[STEP 1] Master battery already ON")
+
+    if con.get_on_ground():
+        print("[STEP 2] Requesting ENGINE AUTOSTART")
+        con.set_engines(True)
+    else:
+        print("[STEP 2] Already airborne? Skipping ENGINE AUTOSTART")
+
+    if con.get_parking_brakes():
+        print("[STEP 3] Parking brake ON → releasing")
+        con.set_parking_brakes(False)
+    else:
+        print("[STEP 3] Parking brake already released")
+
+    print("[STEP 4] Throttle → takeoff power")
+    con.set_throttle_percent(base_throttle_percent)
+
+    # ---- Phase 1: ground roll to rotate (rudder centerline control) ----------
+    last_log_t = time.monotonic()
+    elev_cmd = 0.0
+    thr_cmd  = base_throttle_percent
+    rud_cmd  = 0.0
+
+    # state for yaw-rate estimate
+    _prev_hdg = [runway_hdg]
+    _prev_t   = [time.monotonic()]
+
+    print(f"[STEP 5] Accelerating to rotate speed {rotate_kias:.0f} KIAS… (centerline hold active)")
+    while con.get_ias_kt() < rotate_kias and con.get_on_ground():
+        now = time.monotonic()
+
+        # --- RUDDER: track runway heading/ground track, damp yaw-rate & sideslip
+        track = _get_ground_track_deg()  # deg
+        # Error toward runway heading (use track if available; else heading fallback is inside getter)
+        hdg_err = shortest_angle_deg(runway_hdg - track)  # + means we need to yaw right
+        yaw_rate = _get_yaw_rate_deg_s(_prev_hdg, _prev_t)  # deg/s
+        beta = _get_sideslip_deg()  # deg; positive = wind from right (typically needs right rudder)
+
+        raw_rud = rudder_kh * hdg_err - rudder_kd * yaw_rate + rudder_kbeta * beta
+        raw_rud = clamp(raw_rud, -rudder_limit_pct, +rudder_limit_pct)
+        rud_cmd = slew(rud_cmd, raw_rud, rud_step)
+        con.set_rudder_percent(rud_cmd)
+
+        # --- LOG & pace
+        if now - last_log_t >= 1.0:
+            ias = con.get_ias_kt()
+            alt = con.get_altitude_ft()
+            agl = alt - ground_alt
+            pitch = con.get_pitch_deg()
+            print(
+                f"[ROLL] IAS={ias:.1f} kt | AGL={agl:.0f} ft | PITCH={pitch:+.1f}° | "
+                f"TRACK={track:.1f}° | HDG_ERR={hdg_err:+.1f}° | YAW_RATE={yaw_rate:+.1f}°/s | "
+                f"BETA={beta:+.1f}° | RUD={rud_cmd:+.1f}%"
+            )
+            last_log_t = now
+
+        time.sleep(dt)
+
+    # ---- Phase 2: rotation (smooth ramp to target_pitch_deg) ------------------
+    print(f"[ROTATE] {rotate_kias:.0f} KIAS reached → smooth rotate to ~{target_pitch_deg:.0f}° pitch")
+
+    prev_pitch = con.get_pitch_deg()
+    prev_t     = time.monotonic()
+
+    rotate_duration_s = 5.0
+    rotate_end = prev_t + rotate_duration_s
+    while time.monotonic() < rotate_end and con.get_on_ground():
+        now = time.monotonic()
+        dtm = max(1e-3, now - prev_t)
+        pitch = con.get_pitch_deg()
+        pitch_rate = (pitch - prev_pitch) / dtm  # deg/s
+
+        ias = con.get_ias_kt()
+        target_pitch = target_pitch_deg + clamp((climb_kias - ias) * 0.02, -2.0, 2.0)
+        target_pitch = clamp(target_pitch, 6.0, max_pitch_up_deg - 1.0)
+
+        pitch_err = target_pitch - pitch
+        raw_elev = pitch_kp * pitch_err + pitch_kd * pitch_rate
+
+        # Attitude envelope
+        if pitch > max_pitch_up_deg:
+            raw_elev += +2.0 * (pitch - max_pitch_up_deg)
+        if pitch < max_pitch_dn_deg:
+            raw_elev += -2.0 * (pitch - max_pitch_dn_deg)
+
+        raw_elev = clamp(raw_elev, -25.0, +15.0)
+        elev_cmd = slew(elev_cmd, raw_elev, elev_step)
+        con.set_elevator_percent(elev_cmd)
+
+        # Keep using rudder a bit through rotation (crosswind/torque)
+        track = _get_ground_track_deg()
+        hdg_err = shortest_angle_deg(runway_hdg - track)
+        yaw_rate = _get_yaw_rate_deg_s(_prev_hdg, _prev_t)
+        beta = _get_sideslip_deg()
+        raw_rud = rudder_kh * hdg_err - rudder_kd * yaw_rate + rudder_kbeta * beta
+        raw_rud = clamp(raw_rud, -rudder_limit_pct, +rudder_limit_pct)
+        rud_cmd = slew(rud_cmd, raw_rud, rud_step)
+        con.set_rudder_percent(rud_cmd)
+
+        prev_pitch, prev_t = pitch, now
+        time.sleep(dt)
+
+    # ---- Phase 3: initial climb to 1000 AGL with angle & coordination guard ---
+    print("[CLIMB] Climbing out; gear up at 500 AGL; transitioning to IAS hold at 1,000 AGL.")
+
+    def _agl(): return con.get_altitude_ft() - ground_alt
+
+    # Gear at 500 AGL
+    wait_until(lambda: _agl() >= 500.0, poll_s=0.1)
+    if con.get_landing_gear_down():
+        print("[GEAR] 500 ft AGL reached → Gear UP")
+        con.set_landing_gear_down(False)
+    else:
+        print("[GEAR] Already UP at 500 ft AGL")
+
+    # Maintain controlled pitch + keep ball centered (rudder) until 1000 AGL
+    while _agl() < 1000.0:
+        now = time.monotonic()
+        dtm = max(1e-3, now - prev_t)
+        pitch = con.get_pitch_deg()
+        pitch_rate = (pitch - prev_pitch) / dtm
+        ias = con.get_ias_kt()
+
+        target_pitch = target_pitch_deg + clamp((climb_kias - ias) * ias_to_pitch_gain, -4.0, 4.0)
+        target_pitch = clamp(target_pitch, 6.0, max_pitch_up_deg - 1.0)
+
+        pitch_err = target_pitch - pitch
+        raw_elev = pitch_kp * pitch_err + pitch_kd * pitch_rate
+
+        if pitch > max_pitch_up_deg:
+            raw_elev += +2.0 * (pitch - max_pitch_up_deg)
+        if pitch < max_pitch_dn_deg:
+            raw_elev += -2.0 * (pitch - max_pitch_dn_deg)
+
+        raw_elev = clamp(raw_elev, -22.0, +12.0)
+        elev_cmd = slew(elev_cmd, raw_elev, elev_step)
+        con.set_elevator_percent(elev_cmd)
+
+        # Rudder: now prioritize coordination (beta → 0) more than heading
+        beta = _get_sideslip_deg()
+        yaw_rate = _get_yaw_rate_deg_s(_prev_hdg, _prev_t)
+        # Small heading term to keep initial runway alignment during climb-out
+        track = _get_ground_track_deg()
+        hdg_err = shortest_angle_deg(runway_hdg - track)
+        raw_rud = 0.4 * rudder_kh * hdg_err - rudder_kd * yaw_rate + 1.2 * rudder_kbeta * beta
+        raw_rud = clamp(raw_rud, -rudder_limit_pct, +rudder_limit_pct)
+        rud_cmd = slew(rud_cmd, raw_rud, rud_step)
+        con.set_rudder_percent(rud_cmd)
+
+        # Throttle assist toward climb speed
+        thr_target = base_throttle_percent + (climb_kias - ias) * ias_to_throttle_gain
+        thr_target = clamp(thr_target, 70.0, 100.0)
+        thr_cmd = slew(thr_cmd, thr_target, thr_step)
+        con.set_throttle_percent(thr_cmd)
+
+        # Overshoot management near pitch limit
+        if pitch > (max_pitch_up_deg - 1.0):
+            thr_cmd = max(70.0, thr_cmd - 2.0)
+            con.set_throttle_percent(thr_cmd)
+
+        prev_pitch, prev_t = pitch, now
+        time.sleep(dt)
+
+    print("[CLIMB] 1,000 ft AGL reached → IAS-hold climb with angle protection (rudder coordination continues).")
+
+    # ---- Phase 4: IAS-hold climb to target MSL with angle & throttle control --
+    last_ctrl_log_t = time.monotonic()
+    while con.get_altitude_ft() < target_altitude_ft:
+        now = time.monotonic()
+        dtm = max(1e-3, now - prev_t)
+        pitch = con.get_pitch_deg()
+        pitch_rate = (pitch - prev_pitch) / dtm
+        ias = con.get_ias_kt()
+        alt = con.get_altitude_ft()
+        vsi = con.get_vertical_speed_fpm()
+        agl = alt - ground_alt
+
+        target_pitch = target_pitch_deg + clamp((climb_kias - ias) * ias_to_pitch_gain, -6.0, 6.0)
+        target_pitch = clamp(target_pitch, 5.0, max_pitch_up_deg - 1.0)
+
+        pitch_err = target_pitch - pitch
+        raw_elev = pitch_kp * pitch_err + pitch_kd * pitch_rate
+
+        if pitch > max_pitch_up_deg:
+            raw_elev += +2.5 * (pitch - max_pitch_up_deg)
+        if pitch < max_pitch_dn_deg:
+            raw_elev += -2.5 * (pitch - max_pitch_dn_deg)
+
+        raw_elev = clamp(raw_elev, -22.0, +12.0)
+        elev_cmd = slew(elev_cmd, raw_elev, elev_step)
+        con.set_elevator_percent(elev_cmd)
+
+        # Rudder: keep ball centered (primary), damp yaw-rate (secondary)
+        beta = _get_sideslip_deg()
+        yaw_rate = _get_yaw_rate_deg_s(_prev_hdg, _prev_t)
+        raw_rud = -rudder_kd * yaw_rate + 1.2 * rudder_kbeta * beta
+        raw_rud = clamp(raw_rud, -rudder_limit_pct, +rudder_limit_pct)
+        rud_cmd = slew(rud_cmd, raw_rud, rud_step)
+        con.set_rudder_percent(rud_cmd)
+
+        # Throttle control to chase climb speed without demanding extreme pitch
+        thr_target = base_throttle_percent + (climb_kias - ias) * ias_to_throttle_gain
+        thr_target = clamp(thr_target, 65.0, 100.0)
+        thr_cmd = slew(thr_cmd, thr_target, thr_step)
+        con.set_throttle_percent(thr_cmd)
+
+        if now - last_ctrl_log_t >= 1.0:
+            try:
+                print(
+                    f"[IAS-HOLD] tgtIAS={climb_kias:.0f} | IAS={ias:.1f} kt | ALT={alt:.0f} ft "
+                    f"(AGL {agl:.0f}) | VS={vsi:.0f} fpm | PITCH={pitch:.1f}° "
+                    f"| ELEV={elev_cmd:.1f}% | RUD={rud_cmd:.1f}% | THR={thr_cmd:.1f}%"
+                )
+                last_ctrl_log_t = now
+            except:
+                continue
+
+        prev_pitch, prev_t = pitch, now
+        time.sleep(dt)
+
+    # ---- Phase 5: level-off ---------------------------------------------------
+    print(f"[LEVEL] Target altitude {target_altitude_ft:.0f} ft reached → easing elevator to 0%")
+    while abs(elev_cmd) > 0.5:
+        elev_cmd = slew(elev_cmd, 0.0, elev_step)
+        con.set_elevator_percent(elev_cmd)
+        time.sleep(dt)
+
+    con.set_throttle_percent(clamp(thr_cmd, 60.0, 90.0))
+    # Relax rudder toward neutral as we hand off to next mode
+    while abs(rud_cmd) > 0.5:
+        rud_cmd = slew(rud_cmd, 0.0, rud_step)
+        con.set_rudder_percent(rud_cmd)
+        time.sleep(dt)
+
+    print("[DONE] Takeoff + climb complete with centerline and pitch stabilization.")
+
+
+
 def stabilize_level(
     con: MSFSConnection,
     target_altitude_ft: float,
@@ -799,11 +1653,210 @@ def stabilize_level(
     print("[STAB] Stabilize complete → controls neutralized.")
 
 
+def stabilize_level2(
+    con: MSFSConnection,
+    target_altitude_ft: float,
+    *,
+    hold_heading: bool = True,
+    duration_s: float = 60.0,
+    cruise_throttle_percent: float | None = None,
+    update_hz: float = 5.0
+):
+    """
+    Smoothly converge to target altitude and hold wings level (and heading if enabled),
+    using elevator/aileron + dynamic throttle. Once stabilized, throttle is set to the
+    requested cruise_throttle_percent (if provided).
+    Control conventions:
+      - Elevator: negative = nose up, positive = nose down
+      - Aileron : positive = roll right, negative = roll left
+    """
+
+    import time
+    from math import fmod
+
+    # ---------- helpers ----------
+    def now() -> float: return time.monotonic()
+
+    def clamp(v, lo, hi):
+        return lo if v < lo else hi if v > hi else v
+
+    def shortest_angle_deg(err):
+        # Wrap to [-180, +180]
+        e = fmod(err + 180.0, 360.0)
+        if e < 0:
+            e += 360.0
+        return e - 180.0
+
+    def slew(current, target, step):
+        delta = target - current
+        if abs(delta) <= step:
+            return target
+        return current + (step if delta > 0 else -step)
+
+    dt = 1.0 / max(1.0, update_hz)
+
+    # ---------- references & setup ----------
+    start_t = now()
+    start_alt = con.get_altitude_ft()
+    ref_ias = con.get_ias_kt()          # try to keep speed near current unless told otherwise
+    tgt_hdg = con.get_heading_magnetic_deg() if hold_heading else None
+
+    print(
+        f"[STAB] Target ALT={target_altitude_ft:.0f} ft | "
+        f"Hold heading: {'ON' if tgt_hdg is not None else 'OFF'}"
+        f"{f' (tgt {tgt_hdg:.1f}°M)' if tgt_hdg is not None else ''} | "
+        f"Duration={duration_s:.0f}s | Ref IAS≈{ref_ias:.0f} kt"
+    )
+
+    # Initial throttle: if caller gave cruise, start near it; else keep current (assumed managed elsewhere)
+    thr_cmd = float(clamp(con.get_throttle_percent() if cruise_throttle_percent is None
+                          else cruise_throttle_percent, 50.0, 100.0))
+    con.set_throttle_percent(thr_cmd)
+
+    # Keep current elevator/aileron as bias to avoid fighting trim/autopilot residuals
+    elev_cmd = float(con.get_elevator_percent())
+    ail_cmd = float(con.get_aileron_percent())
+
+    # ---------- controller gains ----------
+    # Altitude hold (PD+I with anti-windup). Use VSI as derivative proxy (ft/min).
+    # Sign: positive alt_err (below target) → need nose-up (negative elevator).
+    Ka = 0.018      # % elevator per ft error (scaled small; 500 ft → ~9%)
+    Kv = 0.0035     # % per fpm (damps with VS: +500 fpm climb → ~+1.75% nose-down)
+    Ki = 0.0006     # % per (ft·s) integral (very gentle)
+
+    elev_min, elev_max = -25.0, +20.0
+    elev_slew_per_s = 35.0               # %/s
+
+    # Heading/Bank hold (heading → bank target, bank → aileron)
+    Kh = 0.5        # deg bank per deg heading error (10° err → 5° bank target)
+    Kb_p = 1.8      # % aileron per deg bank error (P)
+    Kb_d = 0.35     # % per (deg/s) roll-rate (D via bank change)
+    bank_target_limit = 12.0             # deg
+    ail_min, ail_max = -25.0, +25.0
+    ail_slew_per_s = 40.0                # %/s
+
+    # Pitch guardrails (attitude protection during transients)
+    max_pitch_up_deg = 18.0
+    max_pitch_dn_deg = -12.0
+
+    # Throttle dynamics: keep IAS near reference and help vertical damping
+    # Positive (ref_ias - ias) → increase throttle. Negative VSI (descending) → add a little power.
+    Kt_ias = 0.8     # % throttle per knot speed error
+    Kt_vsi = 0.0002  # % throttle per fpm (small; 500 fpm sink → +0.1%)
+    thr_min, thr_max = 55.0, 100.0
+    thr_slew_per_s = 35.0
+
+    # Stabilization criteria to hand throttle back to requested cruise (%)
+    alt_window_ft = 75.0
+    vsi_window_fpm = 150.0
+    stable_hold_s = 4.0
+    stable_since = None
+    cruise_set_done = False
+
+    # Integral state & previous samples
+    alt_int = 0.0
+    prev_bank = con.get_bank_deg()
+    last_log = start_t
+
+    # ---------- loop ----------
+    while now() - start_t < duration_s:
+        t1 = now()
+
+        alt = con.get_altitude_ft()
+        vsi = con.get_vertical_speed_fpm()       # fpm
+        ias = con.get_ias_kt()
+        pitch = con.get_pitch_deg()
+        bank = con.get_bank_deg()
+        hdg = con.get_heading_magnetic_deg()
+
+        # ---- elevator: altitude PD+I (derivative via VSI) ----
+        alt_err = (target_altitude_ft - alt)     # + if we are below target
+        # Anti-windup: only integrate when command not saturated and vertical rate small
+        if elev_min < elev_cmd < elev_max and abs(vsi) < 1200:
+            alt_int += alt_err * dt              # ft·s
+            alt_int = clamp(alt_int, -20000.0, 20000.0)
+
+        raw_elev = (elev_cmd  # use current as bias for smoothness
+                    - Ka * alt_err
+                    + Kv * vsi
+                    - Ki * alt_int)
+
+        # Pitch attitude protection
+        if pitch > max_pitch_up_deg:
+            raw_elev += +2.0 * (pitch - max_pitch_up_deg)   # push
+        if pitch < max_pitch_dn_deg:
+            raw_elev += -2.0 * (pitch - max_pitch_dn_deg)   # pull (note sign)
+
+        # Clamp and slew-limit elevator
+        raw_elev = clamp(raw_elev, elev_min, elev_max)
+        elev_cmd = slew(elev_cmd, raw_elev, elev_slew_per_s * dt)
+        con.set_elevator_percent(elev_cmd)
+
+        # ---- aileron: wings/heading hold ----
+        if tgt_hdg is not None:
+            hdg_err = shortest_angle_deg(tgt_hdg - hdg)     # + need to turn right
+            bank_tgt = clamp(Kh * hdg_err, -bank_target_limit, bank_target_limit)
+        else:
+            hdg_err = 0.0
+            bank_tgt = 0.0
+
+        bank_rate = (bank - prev_bank) / dt                  # deg/s (approx)
+        bank_err = bank_tgt - bank
+        raw_ail = Kb_p * bank_err - Kb_d * bank_rate
+        raw_ail = clamp(raw_ail, ail_min, ail_max)
+        ail_cmd = slew(ail_cmd, raw_ail, ail_slew_per_s * dt)
+        con.set_aileron_percent(ail_cmd)
+        prev_bank = bank
+
+        # ---- throttle: dynamic until stabilized ----
+        if not cruise_set_done:
+            thr_target = thr_cmd + Kt_ias * (ref_ias - ias) + Kt_vsi * (-vsi)
+            thr_target = clamp(thr_target, thr_min, thr_max)
+            thr_cmd = slew(thr_cmd, thr_target, thr_slew_per_s * dt)
+            con.set_throttle_percent(thr_cmd)
+
+        # ---- stabilization detection & cruise handoff ----
+        if abs(alt_err) <= alt_window_ft and abs(vsi) <= vsi_window_fpm:
+            if stable_since is None:
+                stable_since = t1
+            elif not cruise_set_done and cruise_throttle_percent is not None and (t1 - stable_since) >= stable_hold_s:
+                thr_cmd = float(clamp(cruise_throttle_percent, thr_min, thr_max))
+                con.set_throttle_percent(thr_cmd)
+                cruise_set_done = True
+                print(f"[STAB] Altitude stabilized → throttle set to cruise {thr_cmd:.1f}%")
+        else:
+            stable_since = None  # reset dwell if we drift out
+
+        # ---- logging ~1 Hz ----
+        if t1 - last_log >= 1.0:
+            try:
+                print(
+                    f"[HOLD] ALT={alt:.0f} ft (err {alt_err:+.0f}) | VSI={vsi:+.0f} fpm | IAS={ias:.0f} kt "
+                    f"| PITCH={pitch:+.1f}° | BANK={bank:+.1f}° (tgt {bank_tgt:+.1f}°) "
+                    f"| HDG={hdg:.1f}°M{(f' (err {hdg_err:+.1f})' if tgt_hdg is not None else '')} "
+                    f"| ELEV={elev_cmd:+.1f}% | AIL={ail_cmd:+.1f}% | THR={thr_cmd:.1f}%"
+                )
+                last_log = t1
+            except:
+                continue
+
+        # pace the loop
+        sleep_left = dt - (now() - t1)
+        if sleep_left > 0:
+            time.sleep(sleep_left)
+
+    # Optional: neutralize aileron bias a bit if heading hold was off
+    if not hold_heading:
+        con.set_aileron_percent(0.0)
+
+    print("[STAB] Stabilize_level complete.")
+
+
 # MAIN PROCS
 
-def tstab1(con: MSFSConnection, alt: int):
-    takeoff2(con, alt)
-    stabilize_level(con, alt, hold_heading=True, duration_s=120, cruise_throttle_percent=60.0)
+def tstab(con: MSFSConnection, alt: int):
+    takeoff5(con, alt)
+    stabilize_level2(con, alt, cruise_throttle_percent=60)
 
 if __name__ == "__main__":
     import pdb
