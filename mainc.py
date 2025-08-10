@@ -2170,12 +2170,329 @@ def stabilize_level3(
     print("[STAB3] stabilize_level3 complete.")
 
 
+def stabilize_level4(
+    con: MSFSConnection,
+    target_altitude_ft: float,
+    *,
+    hold_heading: bool = True,
+    duration_s: float = 120.0,
+    cruise_throttle_percent: float | None = None,
+    update_hz: float = 15.0,
+    speed_ref_kt: float | None = None,   # if None, lock to current IAS
+):
+    """
+    Altitude capture & hold for fast jets (e.g., Darkstar): anticipatory VSI targeting,
+    pitch-rate damping, continuous trim relief, dynamic throttle, heading/bank hold,
+    rudder coordination, and energy safety gates to prevent uncommanded sink/balloon.
+    Conventions:
+      - Elevator: negative = nose up, positive = nose down
+      - Aileron : positive = roll right, negative = roll left
+      - Rudder  : positive = yaw right, negative = yaw left
+    """
+    import time
+    from math import fmod, atan2, degrees
+
+    # ---------- helpers ----------
+    def now() -> float: return time.monotonic()
+    def clamp(v, lo, hi): return lo if v < lo else hi if v > hi else v
+    def shortest_angle_deg(err):
+        e = fmod(err + 180.0, 360.0)
+        if e < 0: e += 360.0
+        return e - 180.0
+    def slew(current, target, step):
+        d = target - current
+        if abs(d) <= step: return target
+        return current + (step if d > 0 else -step)
+    def lpf(prev, new, alpha):  # exponential moving average
+        return new if prev is None else (alpha * new + (1.0 - alpha) * prev)
+    def get_beta_deg():
+        try: return float(con.get_sideslip_deg())
+        except Exception: return 0.0
+
+    def apply_trim(percent_cmd: float):
+        if hasattr(con, "set_elevator_trim_percent"):
+            try: con.set_elevator_trim_percent(percent_cmd); return
+            except Exception: pass
+        try:
+            axis_val = int(max(-16383, min(16383, round(percent_cmd * 163.83))))
+            con.send_event("ELEVATOR_TRIM_SET", axis_val)
+        except Exception:
+            try: con.send_event("ELEVATOR_TRIM_DOWN" if percent_cmd > 0 else "ELEVATOR_TRIM_UP")
+            except Exception: pass
+
+    dt = 1.0 / max(5.0, update_hz)
+
+    # ---------- refs & setup ----------
+    start_t = now()
+    ias0 = con.get_ias_kt()
+    gs0 = con.get_ground_speed_kt()
+    ref_ias = float(speed_ref_kt) if speed_ref_kt is not None else float(ias0)
+    min_ias_kt = max(0.75 * ref_ias, 160.0)  # safety floor for fast jet
+    tgt_hdg = con.get_heading_magnetic_deg() if hold_heading else None
+
+    print(f"[STAB3] Target ALT={target_altitude_ft:.0f} ft | Heading hold: "
+          f"{'ON' if tgt_hdg is not None else 'OFF'}"
+          f"{f' (tgt {tgt_hdg:.1f}°M)' if tgt_hdg is not None else ''} | "
+          f"Duration={duration_s:.0f}s | Ref IAS≈{ref_ias:.0f} kt")
+
+    # Initial actuators
+    thr_cmd = float(clamp(
+        con.get_throttle_percent() if cruise_throttle_percent is None else cruise_throttle_percent,
+        25.0, 100.0
+    ))
+    con.set_throttle_percent(thr_cmd)
+    elev_cmd = float(con.get_elevator_percent())
+    ail_cmd  = float(con.get_aileron_percent())
+    try:   rud_cmd = float(con.get_rudder_percent())
+    except Exception: rud_cmd = 0.0
+    try:   trim_cmd = float(con.get_elevator_trim_percent())
+    except Exception: trim_cmd = 0.0
+
+    # ---------- gains & limits ----------
+    # Desired-VSI profile (anticipatory; taper near target)
+    Kvs_far = 2.2; Kvs_near = 0.9
+    vs_cap_far = 4000.0; vs_cap_near = 1200.0
+    capture_band_ft = 1000.0
+
+    # Elevator: track (vsi - desired_vsi) + pitch & pitch-rate damping + FPA feed-forward
+    Kvsi = 0.0042               # % per fpm of (vsi - vsi_des)
+    Kpitch = 0.08               # % per deg (toward small pitch)
+    Kpitch_rate = 0.55          # % per deg/s (damping)
+    Kfpa = 0.35                  # % per deg FPA error
+    elev_min, elev_max = -28.0, +18.0  # give a bit more nose-up authority
+    elev_slew_per_s = 70.0
+
+    # Trim relief (slow; only near steady)
+    trim_rate_pct_per_s = 3.0
+    trim_deadband_pct   = 2.0
+    trim_enable_vsi_fpm = 500.0
+    trim_min, trim_max  = -70.0, +70.0
+
+    # Aileron (heading/bank hold) & roll damping
+    Kh = 0.6; Kb_p = 2.2; Kb_d = 0.5
+    bank_target_limit = 8.0
+    ail_min, ail_max = -25.0, +25.0
+    ail_slew_per_s = 80.0
+
+    # Rudder (coordination)
+    Kbeta = 0.9; Kyaw_d = 0.35
+    rud_min, rud_max = -20.0, +20.0
+    rud_slew_per_s = 70.0
+
+    # Attitude guardrails
+    max_pitch_up_deg = 20.0
+    max_pitch_dn_deg = -15.0
+
+    # Throttle PI (+ desired-VSI feed-forward)
+    Kt_p = 0.55; Kt_i = 0.06; Kt_vsi_ff = 0.00025
+    thr_min_base, thr_max = 25.0, 100.0
+    thr_slew_per_s = 22.0
+    ias_int = 0.0; ias_int_min, ias_int_max = -700.0, 700.0
+
+    # Safety gate thresholds
+    climb_need_vsi_gate   = -200.0  # if need climb and VSI < this → emergency climb
+    descent_need_vsi_gate = +200.0  # if need descent and VSI > this → emergency descent
+
+    # Stability criteria
+    alt_win = 50.0; vsi_win = 100.0; ias_win = 12.0
+    pitch_win = 2.5; bank_win = 3.0; beta_win = 1.5
+    ctrl_win = 4.0; thr_rate_win = 3.0
+    stable_hold_s = 4.0
+    stable_since = None
+    cruise_set_done = False
+
+    # ---------- state & filters ----------
+    last_log = start_t
+    prev_bank = con.get_bank_deg()
+    prev_hdg  = con.get_heading_magnetic_deg()
+    prev_pitch = con.get_pitch_deg()
+    prev_thr_cmd = thr_cmd
+
+    ias_f = None; vsi_f = None; pitch_f = None; bank_f = None
+    beta_f = None; yaw_rate_f = None
+    α_ias = 0.25; α_vsi = 0.35; α_pitch = 0.35; α_bank = 0.35; α_beta = 0.4; α_yaw = 0.35
+
+    # ---------- loop ----------
+    while now() - start_t < duration_s:
+        t1 = now()
+
+        # Sensors
+        alt   = con.get_altitude_ft()
+        vsi   = con.get_vertical_speed_fpm()
+        ias   = con.get_ias_kt()
+        gs    = con.get_ground_speed_kt()
+        pitch = con.get_pitch_deg()
+        bank  = con.get_bank_deg()
+        hdg   = con.get_heading_magnetic_deg()
+        beta  = get_beta_deg()
+
+        # Filters
+        ias_f   = lpf(ias_f, ias, α_ias)
+        vsi_f   = lpf(vsi_f, vsi, α_vsi)
+        pitch_f = lpf(pitch_f, pitch, α_pitch)
+        bank_f  = lpf(bank_f, bank, α_bank)
+        beta_f  = lpf(beta_f, beta, α_beta)
+
+        # Derived
+        yaw_rate = shortest_angle_deg(hdg - prev_hdg) / dt
+        yaw_rate_f = lpf(yaw_rate_f, yaw_rate, α_yaw)
+        prev_hdg = hdg
+
+        # Anticipatory desired VSI
+        alt_err = target_altitude_ft - alt
+        dist = abs(alt_err)
+        in_capture = dist <= capture_band_ft
+        Kvs = Kvs_near if in_capture else Kvs_far
+        vs_cap = vs_cap_near if in_capture else vs_cap_far
+        desired_vsi = clamp(Kvs * alt_err, -vs_cap, +vs_cap)
+
+        # Desired FPA (deg) from desired VSI & groundspeed
+        gs_fps = max(1.0, (gs if gs is not None else gs0) * 1.68781)
+        fpa_des_deg = degrees(atan2(desired_vsi / 60.0, gs_fps))
+
+        # ---------- ENERGY SAFETY GATE ----------
+        need_climb   = alt_err > 0.0
+        need_descent = alt_err < 0.0
+        emerg_climb  = need_climb and (vsi_f < climb_need_vsi_gate or ias_f < min_ias_kt)
+        emerg_desc   = need_descent and (vsi_f > descent_need_vsi_gate)
+
+        # ---------- Elevator ----------
+        vsi_err = (vsi_f - desired_vsi)  # positive → more nose-down
+        pitch_rate = (pitch - prev_pitch) / dt
+        prev_pitch = pitch
+
+        raw_elev = (elev_cmd
+                    + Kvsi * vsi_err
+                    + Kpitch * (-pitch_f)
+                    + Kpitch_rate * (+pitch_rate)
+                    + Kfpa * (fpa_des_deg - pitch_f))
+
+        # Safety biases
+        if emerg_climb:  raw_elev -= 3.0   # a bit more nose-up authority
+        if emerg_desc:   raw_elev += 3.0   # a bit more nose-down
+
+        # Guardrails
+        if pitch > max_pitch_up_deg:  raw_elev += +2.0 * (pitch - max_pitch_up_deg)
+        if pitch < max_pitch_dn_deg:  raw_elev += -2.0 * (pitch - max_pitch_dn_deg)
+
+        if in_capture: raw_elev *= 0.85  # soften near target
+        raw_elev = clamp(raw_elev, elev_min, elev_max)
+        elev_cmd = slew(elev_cmd, raw_elev, elev_slew_per_s * dt)
+        con.set_elevator_percent(elev_cmd)
+
+        # ---------- Trim relief ----------
+        if abs(elev_cmd) > trim_deadband_pct and abs(vsi_err) < trim_enable_vsi_fpm and not (emerg_climb or emerg_desc):
+            trim_cmd += (trim_rate_pct_per_s * dt) * (-1.0 if elev_cmd > 0 else +1.0)
+            trim_cmd = clamp(trim_cmd, trim_min, trim_max)
+            apply_trim(trim_cmd)
+
+        # ---------- Aileron / Heading ----------
+        if tgt_hdg is not None:
+            hdg_err = shortest_angle_deg(tgt_hdg - hdg)
+            bank_tgt = clamp(Kh * hdg_err, -bank_target_limit, bank_target_limit)
+        else:
+            hdg_err = 0.0; bank_tgt = 0.0
+
+        bank_rate = (bank - prev_bank) / dt
+        prev_bank = bank
+        raw_ail = clamp(Kb_p * (bank_tgt - bank_f) - Kb_d * bank_rate, ail_min, ail_max)
+        ail_cmd = slew(ail_cmd, raw_ail, ail_slew_per_s * dt)
+        con.set_aileron_percent(ail_cmd)
+
+        # ---------- Rudder / Coordination ----------
+        raw_rud = clamp((-Kbeta * beta_f) - (Kyaw_d * yaw_rate_f), rud_min, rud_max)
+        rud_cmd = slew(rud_cmd, raw_rud, rud_slew_per_s * dt)
+        try: con.set_rudder_percent(rud_cmd)
+        except Exception: pass
+
+        # ---------- Throttle ----------
+        if not cruise_set_done:
+            # Base PI + feed-forward
+            ias_err = (ref_ias - ias_f)
+            can_i = (thr_min_base + 1.0) < thr_cmd < (thr_max - 1.0) and abs(vsi_err) < 2500.0
+            if can_i:
+                ias_int += ias_err * dt
+                ias_int = clamp(ias_int, ias_int_min, ias_int_max)
+
+            ff = Kt_vsi_ff * desired_vsi
+            thr_target = thr_cmd + Kt_p * ias_err + Kt_i * ias_int + ff
+
+            # SAFETY OVERRIDES
+            if emerg_climb:
+                thr_target = thr_max         # go high, fast
+                thr_step = max(thr_slew_per_s, 80.0) * dt
+            elif emerg_desc:
+                thr_target = thr_min_base    # go low, fast
+                thr_step = max(thr_slew_per_s, 80.0) * dt
+            else:
+                # Narrow authority near capture to avoid surges
+                lo, hi = (max(thr_min_base, 30.0), min(thr_max, 95.0)) if in_capture else (thr_min_base, thr_max)
+                thr_target = clamp(thr_target, lo, hi)
+                thr_step = thr_slew_per_s * dt
+
+            prev_thr = thr_cmd
+            thr_cmd = slew(thr_cmd, thr_target, thr_step)
+            con.set_throttle_percent(thr_cmd)
+            thr_rate = (thr_cmd - prev_thr) / dt
+        else:
+            thr_rate = (thr_cmd - prev_thr_cmd) / dt
+        prev_thr_cmd = thr_cmd
+
+        # ---------- Stability & cruise handoff ----------
+        stable = (
+            abs(alt_err) <= alt_win and
+            abs(vsi_f)   <= vsi_win and
+            abs(ref_ias - ias_f) <= ias_win and
+            abs(pitch_f) <= pitch_win and
+            abs(bank_f)  <= bank_win and
+            abs(beta_f)  <= beta_win and
+            abs(elev_cmd) <= ctrl_win and
+            abs(ail_cmd)  <= ctrl_win and
+            abs(thr_rate) <= thr_rate_win and
+            not (emerg_climb or emerg_desc)
+        )
+        if stable:
+            if stable_since is None:
+                stable_since = t1
+            elif not cruise_set_done and cruise_throttle_percent is not None and (t1 - stable_since) >= stable_hold_s:
+                thr_cmd = float(clamp(cruise_throttle_percent, 30.0, 95.0))
+                con.set_throttle_percent(thr_cmd)
+                cruise_set_done = True
+                print(f"[STAB3] Stabilized near target → throttle set to cruise {thr_cmd:.1f}%")
+        else:
+            stable_since = None
+
+        # ---------- logging (~1 Hz) ----------
+        if t1 - last_log >= 1.0:
+            print(
+                f"[HOLD3] ALT={alt:.0f} ft (err {alt_err:+.0f}) | VSI={vsi:+.0f} fpm "
+                f"(des {desired_vsi:+.0f}) | IAS={ias:.0f} kt | GS={gs:.0f} kt "
+                f"| PITCH={pitch:+.1f}° | BANK={bank:+.1f}° | BETA={beta:+.1f}° "
+                f"| ELEV={elev_cmd:+.1f}% | TRIM={trim_cmd:+.1f}% | AIL={ail_cmd:+.1f}% | RUD={rud_cmd:+.1f}% "
+                f"| THR={thr_cmd:.1f}%"
+            )
+            last_log = t1
+
+        # pace
+        sleep_left = dt - (now() - t1)
+        if sleep_left > 0:
+            time.sleep(sleep_left)
+
+    if not hold_heading:
+        con.set_aileron_percent(0.0)
+
+    print("[STAB3] stabilize_level3 complete.")
+
+
 
 # MAIN PROCS
 
 def tstab(con: MSFSConnection, alt: int):
     takeoff5(con, alt)
-    stabilize_level3(con, alt, cruise_throttle_percent=62, duration_s=180)
+    print("GOING FULL THROTTLE for 20 seconds...")
+    con.set_throttle_percent(100)
+    time.sleep(20)
+    stabilize_level4(con, alt)
 
 if __name__ == "__main__":
     import pdb
