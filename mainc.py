@@ -276,7 +276,7 @@ class MSFSConnection:
     def set_engines(self, on: bool) -> None:
         """Start or stop engines using auto-start/auto-shutdown."""
         if on:
-            self.send_event("ENGINE_AUTOSTART")
+            self.send_event("ENGINE_AUTO_START")
         else:
             self.send_event("ENGINE_AUTO_SHUTDOWN")
 
@@ -404,6 +404,122 @@ class MSFSConnection:
         # Average engine 1 position; adjust if you need per-engine.
         val = float(self.get_simvar("GENERAL_ENG_THROTTLE_LEVER_POSITION:1"))
         return val
+
+
+def takeoff(con: MSFSConnection, target_altitude_ft: float, *, climb_kias: float = 180.0):
+    """Automated takeoff using only provided get/set methods, with logs."""
+
+    def wait_until(pred, poll_s=0.1, on_poll=None):
+        """Spin until pred() is True; call on_poll() each tick if provided."""
+        while True:
+            if pred():
+                return
+            if on_poll:
+                on_poll()
+            time.sleep(poll_s)
+
+    # Record starting ground altitude for AGL calc (MSL snapshot at brake release)
+    ground_alt = con.get_altitude_ft()
+    print(f"[INIT] Ground MSL snapshot: {ground_alt:.1f} ft")
+
+    # 1) Battery ON
+    if not con.get_master_battery():
+        print("[STEP 1] Master battery OFF → turning ON")
+        con.set_master_battery(True)
+    else:
+        print("[STEP 1] Master battery already ON")
+
+    # 2) Engines ON (use autostart; idempotent if already running on many aircraft)
+    if con.get_on_ground():
+        print("[STEP 2] Requesting ENGINE AUTOSTART")
+        con.set_engines(True)
+    else:
+        print("[STEP 2] Not on ground (already airborne?) — skipping ENGINE AUTOSTART")
+
+    # 3) Parking brake OFF
+    if con.get_parking_brakes():
+        print("[STEP 3] Parking brake ON → releasing")
+        con.set_parking_brakes(False)
+    else:
+        print("[STEP 3] Parking brake already released")
+
+    # 4) Throttle 100%
+    print("[STEP 4] Throttle → 100%")
+    con.set_throttle_percent(100.0)
+
+    # 5) Rotate at 160 KIAS → elevator -20% (nose up)
+    last_log_t = time.monotonic()
+    def _poll_speed_log():
+        nonlocal last_log_t
+        t = time.monotonic()
+        if t - last_log_t >= 1.0:
+            ias = con.get_ias_kt()
+            alt = con.get_altitude_ft()
+            agl = alt - ground_alt
+            vsi = con.get_vertical_speed_fpm()
+            print(f"[ACCEL] IAS={ias:.1f} kt | ALT={alt:.0f} ft | AGL={agl:.0f} ft | VS={vsi:.0f} fpm")
+            last_log_t = t
+
+    print("[STEP 5] Waiting for rotate speed 160 KIAS…")
+    wait_until(lambda: con.get_ias_kt() >= 160.0, poll_s=0.1, on_poll=_poll_speed_log)
+
+    print("[ROTATE] Reaching 160 KIAS → elevator = -20% (nose up)")
+    con.set_elevator_percent(-20.0)
+
+    # 6) Gear up at 500 ft AGL
+    print("[CLIMB] Holding -20% elevator until 1,000 ft AGL. Gear will retract at 500 ft AGL.")
+    def _agl() -> float:
+        return con.get_altitude_ft() - ground_alt
+
+    # — Gear at 500 AGL
+    wait_until(lambda: _agl() >= 500.0, poll_s=0.1, on_poll=_poll_speed_log)
+    if con.get_landing_gear_down():
+        print("[GEAR] 500 ft AGL reached → Gear UP")
+        con.set_landing_gear_down(False)
+    else:
+        print("[GEAR] Gear already UP at 500 ft AGL")
+
+    # — Keep holding -20% elevator until 1,000 AGL to cleanly climb out
+    wait_until(lambda: _agl() >= 1000.0, poll_s=0.1, on_poll=_poll_speed_log)
+    print("[CLIMB] 1,000 ft AGL reached → switching to IAS-hold climb")
+
+    # 6.5) Simple IAS-hold climb (elevator-only) until target altitude
+    # Control law: elevator% = bias + Kp*(target - IAS), clamped
+    # Notes:
+    #   * Negative elevator = nose up (slower IAS); positive = nose down (faster IAS)
+    #   * Choose gentle gains to avoid porpoising.
+    bias = -10.0         # base nose-up for climb
+    kp = 0.25            # % elevator per knot error (start gentle)
+    elev_min, elev_max = -30.0, +15.0
+    last_ctrl_log_t = time.monotonic()
+
+    def _climb_step():
+        nonlocal last_ctrl_log_t
+        ias = con.get_ias_kt()
+        alt = con.get_altitude_ft()
+        agl = alt - ground_alt
+        vsi = con.get_vertical_speed_fpm()
+        err = (climb_kias - ias)  # +ve if slow → nose down (more + elevator)
+        elev_cmd = max(elev_min, min(elev_max, bias + kp * err))
+        con.set_elevator_percent(elev_cmd)
+
+        t = time.monotonic()
+        if t - last_ctrl_log_t >= 1.0:
+            pitch = con.get_pitch_deg()
+            print(f"[IAS-HOLD] IAS tgt={climb_kias:.0f} | IAS={ias:.1f} kt | ALT={alt:.0f} ft "
+                  f"(AGL {agl:.0f}) | VS={vsi:.0f} fpm | PITCH={pitch:.1f}° | ELEV_CMD={elev_cmd:.1f}%")
+            last_ctrl_log_t = t
+
+    # Climb loop until target MSL altitude reached
+    while con.get_altitude_ft() < target_altitude_ft:
+        _climb_step()
+        time.sleep(0.2)  # control update rate ~5 Hz
+
+    # 7) Level off: elevator to 0% (neutral)
+    print(f"[LEVEL] Target altitude {target_altitude_ft:.0f} ft reached → elevator = 0% (level)")
+    con.set_elevator_percent(0.0)
+    print("[DONE] Takeoff + initial climb complete.")
+
 
 if __name__ == "__main__":
     import pdb
