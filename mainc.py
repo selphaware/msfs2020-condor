@@ -522,9 +522,6 @@ def takeoff(con: MSFSConnection, target_altitude_ft: float, *, climb_kias: float
     print("[DONE] Takeoff + initial climb complete.")
 
 
-import time
-from mainc import MSFSConnection
-
 def takeoff2(
     con: MSFSConnection,
     target_altitude_ft: float,
