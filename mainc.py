@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Callable
 import logging
 import time
+from math import fmod
 
 try:
     # The widely used Python wrapper for MSFS SimConnect
@@ -490,7 +491,7 @@ def takeoff(con: MSFSConnection, target_altitude_ft: float, *, climb_kias: float
     #   * Choose gentle gains to avoid porpoising.
     bias = -10.0         # base nose-up for climb
     kp = 0.25            # % elevator per knot error (start gentle)
-    elev_min, elev_max = -30.0, +15.0
+    elev_min, elev_max = -25.0, +15.0
     last_ctrl_log_t = time.monotonic()
 
     def _climb_step():
@@ -520,6 +521,120 @@ def takeoff(con: MSFSConnection, target_altitude_ft: float, *, climb_kias: float
     con.set_elevator_percent(0.0)
     print("[DONE] Takeoff + initial climb complete.")
 
+
+def stabilize_level(
+    con: MSFSConnection,
+    target_altitude_ft: float,
+    *,
+    hold_heading: bool = True,
+    duration_s: float = 60.0,          # run this long; increase to keep holding
+    cruise_throttle_percent: float | None = None,
+    update_hz: float = 5.0
+):
+    """
+    Hold wings level and maintain target MSL altitude using elevator + aileron.
+    Optionally holds initial magnetic heading. Uses ONLY MSFSConnection getters/setters.
+
+    Control conventions (per your setup):
+      - Elevator: negative = nose up, positive = nose down
+      - Aileron: positive ≈ roll right, negative ≈ roll left
+    """
+
+    # --- Helpers -----------------------------------------------------------
+    def now() -> float: return time.monotonic()
+
+    def clamp(v, lo, hi):
+        return lo if v < lo else hi if v > hi else v
+
+    def shortest_angle_deg(err):
+        # Wrap to [-180, +180]
+        e = fmod(err + 180.0, 360.0)
+        if e < 0:
+            e += 360.0
+        return e - 180.0
+
+    dt = 1.0 / max(1.0, update_hz)
+
+    # --- Set up references & logging --------------------------------------
+    start_time = now()
+    start_alt = con.get_altitude_ft()
+    tgt_hdg = con.get_heading_magnetic_deg() if hold_heading else None
+    print(f"[STAB] Starting stabilize_level for {duration_s:.0f}s "
+          f"→ target ALT={target_altitude_ft:.0f} ft"
+          + (f", heading={tgt_hdg:.1f}°M" if tgt_hdg is not None else ", heading hold: OFF"))
+
+    if cruise_throttle_percent is not None:
+        con.set_throttle_percent(float(cruise_throttle_percent))
+        print(f"[STAB] Throttle set to {cruise_throttle_percent:.1f}%")
+
+    # Use current elevator position as a bias so we don't fight existing trim
+    elev_bias = con.get_elevator_percent()
+    print(f"[STAB] Elev bias (from current): {elev_bias:.1f}% | Start ALT={start_alt:.0f} ft")
+
+    # --- Tunable gains (gentle) -------------------------------------------
+    # Altitude hold with simple PD: elevator_cmd = bias - Ka*alt_err + Kv*VSI
+    #   * alt_err = (target - current). Positive err ⇒ we need to climb ⇒ more nose-up (negative elevator)
+    #     hence the minus sign before Ka.
+    Ka = 0.02     # % elevator per ft of altitude error   (e.g., 500 ft → 10%)
+    Kv = 0.003    # % elevator per fpm of vertical speed  (e.g., +500 fpm → +1.5% nose-down)
+    elev_min, elev_max = -25.0, +25.0
+
+    # Heading/Bank hold: compute a desired bank from heading error, then drive aileron to meet it.
+    Kh = 0.5      # deg bank per deg heading error (soft; 10° err → 5° bank target)
+    Kb = 2.0      # % aileron per deg bank error   (5° bank err → 10% aileron)
+    bank_target_limit = 10.0   # deg
+    ail_min, ail_max = -25.0, +25.0
+
+    last_log = start_time
+
+    # --- Control loop ------------------------------------------------------
+    while now() - start_time < duration_s:
+        alt = con.get_altitude_ft()
+        vsi = con.get_vertical_speed_fpm()     # fpm
+        ias = con.get_ias_kt()
+        pitch = con.get_pitch_deg()
+        bank = con.get_bank_deg()
+        hdg = con.get_heading_magnetic_deg()
+
+        # --- Elevator (altitude hold) ---
+        alt_err = (target_altitude_ft - alt)   # + if below target
+        elev_cmd = elev_bias - Ka * alt_err + Kv * vsi
+        elev_cmd = clamp(elev_cmd, elev_min, elev_max)
+        con.set_elevator_percent(elev_cmd)
+
+        # --- Aileron (wings/heading hold) ---
+        if tgt_hdg is not None:
+            hdg_err = shortest_angle_deg(tgt_hdg - hdg)   # + means we need to turn right
+            bank_tgt = clamp(Kh * hdg_err, -bank_target_limit, bank_target_limit)
+        else:
+            bank_tgt = 0.0  # wings level only
+
+        bank_err = bank_tgt - bank
+        ail_cmd = clamp(Kb * bank_err, ail_min, ail_max)
+        con.set_aileron_percent(ail_cmd)
+
+        # --- Logging (1 Hz) ------------
+        t = now()
+        if t - last_log >= 1.0:
+            print(f"[HOLD] ALT={alt:.0f} ft (err {alt_err:+.0f}) | VSI={vsi:+.0f} fpm | IAS={ias:.0f} kt "
+                  f"| PITCH={pitch:+.1f}° | BANK={bank:+.1f}° (tgt {bank_tgt:+.1f}°) "
+                  f"| HDG={hdg:.1f}°M{f' (err {hdg_err:+.1f})' if tgt_hdg is not None else ''} "
+                  f"| ELEV={elev_cmd:+.1f}% | AIL={ail_cmd:+.1f}%")
+            last_log = t
+
+        time.sleep(dt)
+
+    # Neutralize controls gently when we’re done (optional)
+    con.set_elevator_percent(0.0)
+    con.set_aileron_percent(0.0)
+    print("[STAB] Stabilize complete → controls neutralized.")
+
+
+# MAIN PROCS
+
+def tstab1(con: MSFSConnection, alt: int):
+    takeoff(con, alt)
+    stabilize_level(con, alt, hold_heading=True, duration_s=120, cruise_throttle_percent=60.0)
 
 if __name__ == "__main__":
     import pdb
