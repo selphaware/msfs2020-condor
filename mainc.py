@@ -522,6 +522,178 @@ def takeoff(con: MSFSConnection, target_altitude_ft: float, *, climb_kias: float
     print("[DONE] Takeoff + initial climb complete.")
 
 
+import time
+from mainc import MSFSConnection
+
+def takeoff2(
+    con: MSFSConnection,
+    target_altitude_ft: float,
+    *,
+    rotate_kias: float = 160.0,
+    target_pitch_deg: float = 12.0,   # rotation pitch target
+    climb_kias: float = 180.0         # IAS to hold after 1,000 ft AGL
+):
+    """Stabilized takeoff with smooth rotation and IAS-hold climb (get/set only)."""
+
+    # ---------------- helpers ----------------
+    def wait_until(pred, poll_s=0.1, on_poll=None):
+        while True:
+            if pred():
+                return
+            if on_poll:
+                on_poll()
+            time.sleep(poll_s)
+
+    def clamp(v, lo, hi):
+        return lo if v < lo else hi if v > hi else v
+
+    # --------- snapshot for AGL & logging ----------
+    ground_alt = con.get_altitude_ft()
+    print(f"[INIT] Ground MSL snapshot: {ground_alt:.1f} ft")
+
+    # 1) Battery ON
+    if not con.get_master_battery():
+        print("[STEP 1] Master battery OFF → turning ON")
+        con.set_master_battery(True)
+    else:
+        print("[STEP 1] Master battery already ON")
+
+    # 2) Engines ON
+    if con.get_on_ground():
+        print("[STEP 2] Requesting ENGINE AUTOSTART")
+        con.set_engines(True)
+    else:
+        print("[STEP 2] Not on ground (already airborne?) — skipping ENGINE AUTOSTART")
+
+    # 3) Parking brake OFF
+    if con.get_parking_brakes():
+        print("[STEP 3] Parking brake ON → releasing")
+        con.set_parking_brakes(False)
+    else:
+        print("[STEP 3] Parking brake already released")
+
+    # 4) Throttle 100%
+    print("[STEP 4] Throttle → 100%")
+    con.set_throttle_percent(100.0)
+
+    # 5) Rotate at rotate_kias → smooth pitch-hold (nose up = NEGATIVE elevator)
+    last_log_t = time.monotonic()
+    def _poll_speed_log():
+        nonlocal last_log_t
+        t = time.monotonic()
+        if t - last_log_t >= 1.0:
+            ias  = con.get_ias_kt()
+            alt  = con.get_altitude_ft()
+            agl  = alt - ground_alt
+            vsi  = con.get_vertical_speed_fpm()
+            pitch= con.get_pitch_deg()
+            elev = con.get_elevator_percent()
+            print(f"[ACCEL] IAS={ias:.1f} kt | ALT={alt:.0f} ft | AGL={agl:.0f} ft | "
+                  f"VS={vsi:.0f} fpm | PITCH={pitch:+.1f}° | ELEV={elev:+.1f}%")
+            last_log_t = t
+
+    print(f"[STEP 5] Waiting for rotate speed {rotate_kias:.0f} KIAS…")
+    wait_until(lambda: con.get_ias_kt() >= rotate_kias, poll_s=0.1, on_poll=_poll_speed_log)
+
+    # ---- Smooth rotation & pitch hold to 1,000 ft AGL ----
+    print(f"[ROTATE] {rotate_kias:.0f} KIAS reached → begin smooth rotation (pitch-hold ≈ {target_pitch_deg:.0f}°)")
+    elev_cmd = con.get_elevator_percent()
+    elev_min, elev_max = -30.0, +15.0      # safety limits (NEG = nose up)
+    max_step_per_tick = 3.0                # % per control update (rate limit)
+    dt = 0.05                              # 20 Hz control during rotation
+    Kp = 1.2                               # % elevator per deg pitch error
+    Kd = 0.9                               # % elevator per deg/s pitch rate
+    last_pitch = con.get_pitch_deg()
+    last_t = time.monotonic()
+
+    # Small initial nudge (not a big step) to start rotation
+    elev_cmd = clamp(elev_cmd - 8.0, elev_min, elev_max)
+    con.set_elevator_percent(elev_cmd)
+
+    print("[CLIMB] Pitch-hold active until 1,000 ft AGL. Gear will retract at 500 ft AGL.")
+    gear_up_done = False
+
+    def _agl(): return con.get_altitude_ft() - ground_alt
+
+    while _agl() < 1000.0:
+        # state
+        t = time.monotonic()
+        pitch = con.get_pitch_deg()
+        dt_s = max(1e-3, t - last_t)
+        pitch_rate = (pitch - last_pitch) / dt_s
+        last_pitch, last_t = pitch, t
+
+        # control: make elevator more NEGATIVE for more nose-up
+        pitch_err = target_pitch_deg - pitch          # + if we need more nose-up
+        raw_cmd = elev_cmd - (Kp * pitch_err) + (Kd * pitch_rate)
+
+        # rate limit & clamp
+        delta = clamp(raw_cmd - elev_cmd, -max_step_per_tick, +max_step_per_tick)
+        elev_cmd = clamp(elev_cmd + delta, elev_min, elev_max)
+        con.set_elevator_percent(elev_cmd)
+
+        # gear at 500 AGL (once)
+        if not gear_up_done and _agl() >= 500.0:
+            if con.get_landing_gear_down():
+                print("[GEAR] 500 ft AGL → Gear UP")
+                con.set_landing_gear_down(False)
+            else:
+                print("[GEAR] Already UP at 500 ft AGL")
+            gear_up_done = True
+
+        _poll_speed_log()
+        time.sleep(dt)
+
+    print("[CLIMB] 1,000 ft AGL reached → switching to IAS-hold climb")
+
+    # 6) IAS-hold climb (gentle) until target MSL altitude
+    #    elevator% = bias + kp*(climb_kias - IAS); trim assist keeps elevator near a small negative
+    bias = -8.0              # base nose-up
+    kp_ias = 0.22            # % elevator per knot error
+    elev_min, elev_max = -25.0, +15.0
+    trim_target_elev = -5.0  # aim to keep commanded elevator near this
+    last_ctrl_log_t = time.monotonic()
+    last_trim_update = time.monotonic()
+    trim_update_interval = 1.5  # seconds
+
+    while con.get_altitude_ft() < target_altitude_ft:
+        ias = con.get_ias_kt()
+        alt = con.get_altitude_ft()
+        agl = alt - ground_alt
+        vsi = con.get_vertical_speed_fpm()
+
+        err = (climb_kias - ias)  # + if slow → more nose-down (POS elevator)
+        elev_cmd = clamp(bias + kp_ias * err, elev_min, elev_max)
+        con.set_elevator_percent(elev_cmd)
+
+        # Trim assist: adjust absolute trim to keep elevator around trim_target_elev
+        if time.monotonic() - last_trim_update >= trim_update_interval:
+            current_elev = con.get_elevator_percent()
+            current_trim = con.get_trim_percent()
+            trim_err = trim_target_elev - current_elev
+            trim_step = clamp(0.3 * trim_err, -2.0, 2.0)         # small, gentle
+            new_trim = clamp(current_trim + trim_step, -100.0, 100.0)
+            if abs(trim_step) > 0.05:
+                con.set_trim_percent(new_trim)                   # absolute trim position
+                print(f"[TRIM] Trim {current_trim:+.1f}% → {new_trim:+.1f}% (elev {current_elev:+.1f}%)")
+            last_trim_update = time.monotonic()
+
+        # 1 Hz status
+        t = time.monotonic()
+        if t - last_ctrl_log_t >= 1.0:
+            pitch = con.get_pitch_deg()
+            print(f"[IAS-HOLD] IAS tgt={climb_kias:.0f} | IAS={ias:.1f} kt | ALT={alt:.0f} ft "
+                  f"(AGL {agl:.0f}) | VS={vsi:.0f} fpm | PITCH={pitch:+.1f}° | ELEV={elev_cmd:+.1f}%")
+            last_ctrl_log_t = t
+
+        time.sleep(0.2)  # ~5 Hz
+
+    # 7) Level at target: neutralize elevator (leave throttle to user or AP)
+    print(f"[LEVEL] Target altitude {target_altitude_ft:.0f} ft reached → elevator = 0% (level)")
+    con.set_elevator_percent(0.0)
+    print("[DONE] Takeoff + initial climb complete.")
+
+
 def stabilize_level(
     con: MSFSConnection,
     target_altitude_ft: float,
@@ -633,7 +805,7 @@ def stabilize_level(
 # MAIN PROCS
 
 def tstab1(con: MSFSConnection, alt: int):
-    takeoff(con, alt)
+    takeoff2(con, alt)
     stabilize_level(con, alt, hold_heading=True, duration_s=120, cruise_throttle_percent=60.0)
 
 if __name__ == "__main__":
